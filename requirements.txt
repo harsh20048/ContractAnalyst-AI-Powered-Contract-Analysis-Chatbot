@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+python-multipart
+langchain
+pypdf2
+python-dotenv
+jinja2
+langchain-google-genai
+google-generativeai
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+streamlit
+faiss-cpu
