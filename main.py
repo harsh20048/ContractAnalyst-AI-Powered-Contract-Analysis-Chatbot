@@ -32,6 +32,11 @@ from hf_framework import (
     EXTRACTION_TASKS,
     MODEL_CONFIGS
 )
+from hf_framework.training_data_extractor import TrainingDataExtractor, TrainingDataPoint
+from hf_framework.training_pipeline import TrainingPipeline, TrainingConfig
+import zipfile
+import io
+import pandas as pd
 
 # Configure logging
 logging.basicConfig(
@@ -105,6 +110,21 @@ class ProcessingStatusResponse(BaseModel):
     error: Optional[str] = None
 
 
+class BatchExtractionRequest(BaseModel):
+    """Request model for batch PDF extraction."""
+    tasks: List[str] = Field(default=["date", "company_name", "company_address", "tables", "angebot"], 
+                            description="Parameters to extract")
+    output_format: str = Field(default="excel", description="Output format: excel or json")
+    include_raw_text: bool = Field(False, description="Include raw text in output")
+
+
+class TrainingRequest(BaseModel):
+    """Request model for training pipeline."""
+    pdf_directory: str = Field(..., description="Directory containing PDF files")
+    labeled_excel_path: Optional[str] = Field(None, description="Path to labeled Excel file")
+    output_directory: str = Field(default="./training_output", description="Output directory")
+    
+    
 # Health check endpoint
 @app.get("/health")
 async def health_check():
@@ -744,6 +764,425 @@ async def get_frontend():
     return html_content
 
 
+# Training Data Extraction Endpoints
+@app.post("/training/extract-batch")
+async def extract_training_data_batch(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...),
+    request: BatchExtractionRequest = None
+):
+    """Extract training data from multiple PDF files."""
+    
+    if len(files) > 50:
+        raise HTTPException(status_code=400, detail="Maximum 50 files allowed per batch")
+    
+    # Validate files
+    for file in files:
+        if not file.filename.lower().endswith('.pdf'):
+            raise HTTPException(status_code=400, detail=f"File {file.filename} is not a PDF")
+    
+    try:
+        # Create temporary directory for batch processing
+        import tempfile
+        import shutil
+        
+        temp_dir = tempfile.mkdtemp()
+        
+        # Save uploaded files
+        pdf_paths = []
+        for file in files:
+            temp_path = os.path.join(temp_dir, file.filename)
+            with open(temp_path, 'wb') as f:
+                content = await file.read()
+                f.write(content)
+            pdf_paths.append(temp_path)
+        
+        # Extract data from all PDFs
+        results = []
+        for pdf_path in pdf_paths:
+            result = training_extractor.extract_from_pdf(pdf_path)
+            results.append(result)
+        
+        # Convert to desired format
+        if request and request.output_format == "json":
+            output_data = [result.to_dict() for result in results]
+            response_data = {
+                "success": True,
+                "total_files": len(results),
+                "extracted_data": output_data,
+                "summary": {
+                    "successful_extractions": len([r for r in results if not r.errors]),
+                    "failed_extractions": len([r for r in results if r.errors]),
+                    "date_extracted": len([r for r in results if r.date]),
+                    "company_name_extracted": len([r for r in results if r.company_name]),
+                    "address_extracted": len([r for r in results if r.company_address]),
+                    "tables_found": len([r for r in results if r.tables]),
+                    "angebot_found": len([r for r in results if r.angebot])
+                }
+            }
+        else:
+            # Create Excel file in memory
+            excel_buffer = io.BytesIO()
+            training_extractor.save_to_excel(results, excel_buffer)
+            excel_buffer.seek(0)
+            
+            # Clean up temp directory
+            shutil.rmtree(temp_dir)
+            
+            # Return Excel file
+            from fastapi.responses import StreamingResponse
+            return StreamingResponse(
+                io.BytesIO(excel_buffer.read()),
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={"Content-Disposition": "attachment; filename=extracted_training_data.xlsx"}
+            )
+        
+        # Clean up temp directory
+        shutil.rmtree(temp_dir)
+        
+        return response_data
+        
+    except Exception as e:
+        # Clean up temp directory if it exists
+        if 'temp_dir' in locals():
+            try:
+                shutil.rmtree(temp_dir)
+            except:
+                pass
+        
+        logger.error(f"Error in batch extraction: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/training/extract-single")
+async def extract_training_data_single(file: UploadFile = File(...)):
+    """Extract training data from a single PDF file."""
+    
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="File must be a PDF")
+    
+    try:
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+            content = await file.read()
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+        
+        # Extract training data
+        result = training_extractor.extract_from_pdf(temp_file_path)
+        
+        # Clean up temp file
+        os.unlink(temp_file_path)
+        
+        # Return structured result
+        return {
+            "success": True,
+            "file_name": file.filename,
+            "extracted_data": {
+                "date": result.date,
+                "company_name": result.company_name,
+                "company_address": result.company_address,
+                "tables": result.tables,
+                "angebot": result.angebot
+            },
+            "metadata": {
+                "page_count": result.page_count,
+                "processing_time": result.processing_time,
+                "errors": result.errors
+            }
+        }
+        
+    except Exception as e:
+        # Clean up temp file if it exists
+        if 'temp_file_path' in locals():
+            try:
+                os.unlink(temp_file_path)
+            except:
+                pass
+        
+        logger.error(f"Error extracting training data: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/training/upload-labeled-data")
+async def upload_labeled_excel(file: UploadFile = File(...)):
+    """Upload labeled Excel data for training."""
+    
+    if not file.filename.lower().endswith(('.xlsx', '.xls')):
+        raise HTTPException(status_code=400, detail="File must be an Excel file (.xlsx or .xls)")
+    
+    try:
+        # Save uploaded Excel file
+        excel_path = f"./labeled_data_{file.filename}"
+        with open(excel_path, 'wb') as f:
+            content = await file.read()
+            f.write(content)
+        
+        # Load and validate the Excel data
+        df = training_extractor.load_labeled_data(excel_path)
+        
+        # Validate required columns
+        required_columns = ['file_name', 'date', 'company_name', 'company_address', 'angebot']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        
+        if missing_columns:
+            os.unlink(excel_path)  # Clean up
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Missing required columns: {missing_columns}"
+            )
+        
+        # Return validation results
+        return {
+            "success": True,
+            "file_path": excel_path,
+            "total_rows": len(df),
+            "columns": list(df.columns),
+            "data_preview": df.head(5).to_dict('records'),
+            "completeness": {
+                col: f"{df[col].notna().sum()}/{len(df)} ({df[col].notna().mean():.1%})"
+                for col in required_columns if col in df.columns
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error uploading labeled data: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/training/start-pipeline")
+async def start_training_pipeline(
+    background_tasks: BackgroundTasks,
+    pdf_files: List[UploadFile] = File(...),
+    labeled_excel: Optional[UploadFile] = File(None),
+    output_directory: str = "./training_output"
+):
+    """Start the complete training pipeline."""
+    
+    if len(pdf_files) > 50:
+        raise HTTPException(status_code=400, detail="Maximum 50 PDF files allowed")
+    
+    try:
+        import tempfile
+        import shutil
+        
+        # Create temporary directories
+        temp_pdf_dir = tempfile.mkdtemp(prefix="training_pdfs_")
+        
+        # Save PDF files
+        for file in pdf_files:
+            if not file.filename.lower().endswith('.pdf'):
+                shutil.rmtree(temp_pdf_dir)
+                raise HTTPException(status_code=400, detail=f"File {file.filename} is not a PDF")
+            
+            temp_path = os.path.join(temp_pdf_dir, file.filename)
+            with open(temp_path, 'wb') as f:
+                content = await file.read()
+                f.write(content)
+        
+        # Save labeled Excel file if provided
+        labeled_excel_path = None
+        if labeled_excel:
+            if not labeled_excel.filename.lower().endswith(('.xlsx', '.xls')):
+                shutil.rmtree(temp_pdf_dir)
+                raise HTTPException(status_code=400, detail="Labeled file must be Excel format")
+            
+            labeled_excel_path = f"./temp_labeled_{labeled_excel.filename}"
+            with open(labeled_excel_path, 'wb') as f:
+                content = await labeled_excel.read()
+                f.write(content)
+        
+        # Generate job ID for tracking
+        import uuid
+        job_id = str(uuid.uuid4())
+        
+        # Initialize job status
+        processing_status[job_id] = {
+            "status": "processing",
+            "progress": 0.0,
+            "message": "Starting training pipeline",
+            "started_at": datetime.now(),
+            "completed_at": None,
+            "result": None,
+            "error": None
+        }
+        
+        # Run training pipeline in background
+        background_tasks.add_task(
+            run_training_pipeline_background,
+            job_id,
+            temp_pdf_dir,
+            labeled_excel_path,
+            output_directory
+        )
+        
+        return {
+            "job_id": job_id,
+            "status": "started",
+            "message": f"Training pipeline started with {len(pdf_files)} PDF files",
+            "pdf_count": len(pdf_files),
+            "has_labeled_data": labeled_excel is not None
+        }
+        
+    except Exception as e:
+        logger.error(f"Error starting training pipeline: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def run_training_pipeline_background(
+    job_id: str,
+    pdf_directory: str,
+    labeled_excel_path: Optional[str],
+    output_directory: str
+):
+    """Background task for running the training pipeline."""
+    try:
+        # Update status
+        processing_status[job_id]["progress"] = 0.1
+        processing_status[job_id]["message"] = "Extracting data from PDFs"
+        
+        # Run the pipeline
+        results = training_pipeline.run_full_pipeline(
+            pdf_directory=pdf_directory,
+            labeled_excel_path=labeled_excel_path,
+            output_dir=output_directory
+        )
+        
+        processing_status[job_id]["progress"] = 1.0
+        processing_status[job_id]["status"] = "completed"
+        processing_status[job_id]["message"] = "Training pipeline completed successfully"
+        processing_status[job_id]["completed_at"] = datetime.now()
+        processing_status[job_id]["result"] = {
+            "output_directory": output_directory,
+            "trained_models": list(results.get('trained_models', {}).keys()),
+            "data_quality_score": results.get('data_quality', {}).get('quality_score', 0.0),
+            "total_samples": results.get('data_quality', {}).get('total_samples', 0)
+        }
+        
+        # Clean up temporary files
+        import shutil
+        shutil.rmtree(pdf_directory)
+        if labeled_excel_path and os.path.exists(labeled_excel_path):
+            os.unlink(labeled_excel_path)
+        
+    except Exception as e:
+        processing_status[job_id]["status"] = "failed"
+        processing_status[job_id]["progress"] = 0.0
+        processing_status[job_id]["message"] = "Training pipeline failed"
+        processing_status[job_id]["completed_at"] = datetime.now()
+        processing_status[job_id]["error"] = str(e)
+        
+        # Clean up on error
+        try:
+            import shutil
+            shutil.rmtree(pdf_directory)
+            if labeled_excel_path and os.path.exists(labeled_excel_path):
+                os.unlink(labeled_excel_path)
+        except:
+            pass
+
+
+@app.get("/training/download-template")
+async def download_excel_template():
+    """Download Excel template for labeling training data."""
+    
+    # Create template DataFrame
+    template_data = {
+        'file_name': ['example1.pdf', 'example2.pdf', 'example3.pdf'],
+        'date': ['2024-01-15', '15.02.2024', '03/03/2024'],
+        'company_name': ['TechCorp GmbH', 'Global Industries AG', 'Innovation Ltd'],
+        'company_address': ['Musterstraße 123, 12345 Berlin', 'Hauptplatz 1, 1010 Wien', '123 Main St, London'],
+        'angebot': ['Angebot Nr. A-2024-001', 'Quote #Q-2024-002', 'Proposal ID: P-2024-003'],
+        'tables_count': [2, 1, 3],
+        'notes': ['Example entry - replace with actual data', 'Training data template', 'Delete these examples']
+    }
+    
+    df = pd.DataFrame(template_data)
+    
+    # Create Excel file in memory
+    excel_buffer = io.BytesIO()
+    with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
+        df.to_excel(writer, sheet_name='Training_Data', index=False)
+        
+        # Add instructions sheet
+        instructions = pd.DataFrame({
+            'Instructions': [
+                '1. Replace the example data with your actual labeled data',
+                '2. file_name: Exact name of the PDF file',
+                '3. date: Date found in the document (any format)',
+                '4. company_name: Full company name with legal form',
+                '5. company_address: Complete address including postal code',
+                '6. angebot: Quote/offer number or description',
+                '7. tables_count: Number of tables found (for validation)',
+                '8. notes: Optional notes about the document',
+                '',
+                'Save this file and upload it using the /training/upload-labeled-data endpoint'
+            ]
+        })
+        instructions.to_excel(writer, sheet_name='Instructions', index=False)
+    
+    excel_buffer.seek(0)
+    
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(
+        io.BytesIO(excel_buffer.read()),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=training_data_template.xlsx"}
+    )
+
+
+@app.get("/training/status/{job_id}")
+async def get_training_status(job_id: str):
+    """Get status of training pipeline job."""
+    if job_id not in processing_status:
+        raise HTTPException(status_code=404, detail="Training job not found")
+    
+    return processing_status[job_id]
+
+
+@app.get("/training/results/{job_id}")
+async def download_training_results(job_id: str):
+    """Download training results as ZIP file."""
+    
+    if job_id not in processing_status:
+        raise HTTPException(status_code=404, detail="Training job not found")
+    
+    job_status = processing_status[job_id]
+    
+    if job_status["status"] != "completed":
+        raise HTTPException(status_code=400, detail="Training job not completed")
+    
+    output_dir = job_status["result"]["output_directory"]
+    
+    if not os.path.exists(output_dir):
+        raise HTTPException(status_code=404, detail="Training results not found")
+    
+    try:
+        # Create ZIP file in memory
+        zip_buffer = io.BytesIO()
+        
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            # Add all files from output directory
+            for root, dirs, files in os.walk(output_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arc_name = os.path.relpath(file_path, output_dir)
+                    zip_file.write(file_path, arc_name)
+        
+        zip_buffer.seek(0)
+        
+        from fastapi.responses import StreamingResponse
+        return StreamingResponse(
+            io.BytesIO(zip_buffer.read()),
+            media_type="application/zip",
+            headers={"Content-Disposition": f"attachment; filename=training_results_{job_id}.zip"}
+        )
+        
+    except Exception as e:
+        logger.error(f"Error creating training results ZIP: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # Startup event
 @app.on_event("startup")
 async def startup_event():
@@ -753,6 +1192,12 @@ async def startup_event():
     
     # Ensure directories exist
     settings._ensure_directories()
+    
+    # Initialize training components
+    global training_extractor
+    global training_pipeline
+    training_extractor = TrainingDataExtractor()
+    training_pipeline = TrainingPipeline()
     
     # Optionally warm up default models
     # extraction_engine.warm_up(["summarization"])
