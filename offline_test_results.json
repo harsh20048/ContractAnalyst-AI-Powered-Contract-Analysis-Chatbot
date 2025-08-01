@@ -1,0 +1,48 @@
+{
+  "total_tests": 8,
+  "passed_tests": 8,
+  "success_rate": 1.0,
+  "all_passed": true,
+  "results": [
+    {
+      "test": "Server Health Check",
+      "success": true,
+      "details": "Status: healthy, Mode: offline"
+    },
+    {
+      "test": "Configuration Endpoints",
+      "success": true,
+      "details": "Tasks: 5, Models: 1"
+    },
+    {
+      "test": "Single PDF Extraction",
+      "success": true,
+      "details": "Extracted 5/5 parameters, Time: 0.009s"
+    },
+    {
+      "test": "Batch PDF Extraction",
+      "success": true,
+      "details": "Processed 1 files, Success: 1"
+    },
+    {
+      "test": "Supervised Training",
+      "success": true,
+      "details": "Trained on 1 examples, Overall accuracy: 75.0%"
+    },
+    {
+      "test": "Excel Template Download",
+      "success": true,
+      "details": "Downloaded template, Size: 5983 bytes"
+    },
+    {
+      "test": "Web Interface",
+      "success": true,
+      "details": "Web interface loaded, Size: 10901 characters"
+    },
+    {
+      "test": "Parameter Extraction Accuracy",
+      "success": true,
+      "details": "Parameter extraction patterns validated"
+    }
+  ]
+}
