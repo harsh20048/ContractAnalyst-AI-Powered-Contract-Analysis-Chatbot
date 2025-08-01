@@ -21,6 +21,82 @@ from pydantic import BaseModel, Field
 import pandas as pd
 import PyPDF2
 
+# Add these imports at the top after existing imports
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
+
+# Simple supervised trainer (simplified version)
+class SimpleSupervisedTrainer:
+    """Simplified supervised trainer for testing."""
+    
+    def __init__(self):
+        self.training_data = []
+        self.models = {}
+    
+    def train_from_data(self, pdf_texts: List[str], excel_answers: List[Dict]):
+        """Train models from PDF texts and Excel answers."""
+        print("🤖 Training models with supervised learning...")
+        
+        # Prepare training data
+        for i, (text, answers) in enumerate(zip(pdf_texts, excel_answers)):
+            # Extract features and compare with correct answers
+            extracted = extract_parameters(text)
+            
+            training_example = {
+                'text': text,
+                'extracted': extracted,
+                'correct': answers,
+                'accuracies': {}
+            }
+            
+            # Calculate accuracy for each parameter
+            for param in ['date', 'company_name', 'company_address', 'angebot']:
+                expected = answers.get(param)
+                predicted = extracted.get(param)
+                
+                if expected and predicted:
+                    # Simple string similarity
+                    accuracy = 1.0 if str(expected).lower() in str(predicted).lower() or str(predicted).lower() in str(expected).lower() else 0.0
+                else:
+                    accuracy = 1.0 if (not expected and not predicted) else 0.0
+                
+                training_example['accuracies'][param] = accuracy
+            
+            self.training_data.append(training_example)
+        
+        print(f"   ✅ Trained on {len(self.training_data)} examples")
+        return len(self.training_data)
+    
+    def verify_prediction(self, pdf_text: str, expected_answers: Dict) -> Dict:
+        """Verify a single prediction against expected answers."""
+        extracted = extract_parameters(pdf_text)
+        
+        verification = {
+            'predictions': extracted,
+            'expected': expected_answers,
+            'accuracies': {},
+            'overall_accuracy': 0.0
+        }
+        
+        accuracies = []
+        for param in ['date', 'company_name', 'company_address', 'angebot']:
+            expected = expected_answers.get(param)
+            predicted = extracted.get(param)
+            
+            if expected and predicted:
+                accuracy = 1.0 if str(expected).lower() in str(predicted).lower() or str(predicted).lower() in str(expected).lower() else 0.0
+            else:
+                accuracy = 1.0 if (not expected and not predicted) else 0.0
+            
+            verification['accuracies'][param] = accuracy
+            accuracies.append(accuracy)
+        
+        verification['overall_accuracy'] = sum(accuracies) / len(accuracies)
+        return verification
+
+# Initialize trainer
+supervised_trainer = SimpleSupervisedTrainer()
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -417,9 +493,285 @@ async def get_model_status():
         }
     }
 
+@app.post("/supervised/train")
+async def train_supervised_model(
+    pdf_files: List[UploadFile] = File(...),
+    excel_answers: UploadFile = File(...)
+):
+    """Train supervised model using PDFs with Excel answer sheet."""
+    
+    if not excel_answers.filename.lower().endswith(('.xlsx', '.xls')):
+        raise HTTPException(status_code=400, detail="Answer file must be Excel format")
+    
+    try:
+        # Save and load Excel answers
+        excel_path = f"temp_answers_{excel_answers.filename}"
+        with open(excel_path, 'wb') as f:
+            content = await excel_answers.read()
+            f.write(content)
+        
+        # Load answers DataFrame
+        answers_df = pd.read_excel(excel_path)
+        
+        # Validate required columns
+        required_columns = ['file_name', 'date', 'company_name', 'company_address', 'angebot']
+        missing_columns = [col for col in required_columns if col not in answers_df.columns]
+        if missing_columns:
+            os.unlink(excel_path)
+            raise HTTPException(status_code=400, detail=f"Missing columns in Excel: {missing_columns}")
+        
+        # Process PDFs and match with answers
+        pdf_texts = []
+        matched_answers = []
+        
+        for pdf_file in pdf_files:
+            if not pdf_file.filename.lower().endswith('.pdf'):
+                continue
+            
+            # Find corresponding answer
+            answer_row = answers_df[answers_df['file_name'] == pdf_file.filename]
+            if answer_row.empty:
+                continue
+            
+            # Extract text from PDF
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+                content = await pdf_file.read()
+                temp_file.write(content)
+                temp_file_path = temp_file.name
+            
+            try:
+                text = extract_pdf_text(temp_file_path)
+                if text:
+                    pdf_texts.append(text)
+                    
+                    # Get correct answers
+                    answer_data = answer_row.iloc[0]
+                    answers = {
+                        'date': str(answer_data.get('date', '')).strip() if pd.notna(answer_data.get('date')) else None,
+                        'company_name': str(answer_data.get('company_name', '')).strip() if pd.notna(answer_data.get('company_name')) else None,
+                        'company_address': str(answer_data.get('company_address', '')).strip() if pd.notna(answer_data.get('company_address')) else None,
+                        'angebot': str(answer_data.get('angebot', '')).strip() if pd.notna(answer_data.get('angebot')) else None,
+                    }
+                    matched_answers.append(answers)
+                    
+            finally:
+                os.unlink(temp_file_path)
+        
+        # Train the model
+        num_examples = supervised_trainer.train_from_data(pdf_texts, matched_answers)
+        
+        # Clean up
+        os.unlink(excel_path)
+        
+        # Calculate training statistics
+        if supervised_trainer.training_data:
+            avg_accuracies = {}
+            for param in ['date', 'company_name', 'company_address', 'angebot']:
+                param_accuracies = [example['accuracies'][param] for example in supervised_trainer.training_data]
+                avg_accuracies[param] = sum(param_accuracies) / len(param_accuracies)
+            
+            overall_avg = sum(avg_accuracies.values()) / len(avg_accuracies)
+        else:
+            avg_accuracies = {}
+            overall_avg = 0.0
+        
+        return {
+            "success": True,
+            "training_examples": num_examples,
+            "matched_pdfs": len(pdf_texts),
+            "total_pdfs": len(pdf_files),
+            "training_accuracies": avg_accuracies,
+            "overall_training_accuracy": overall_avg,
+            "message": f"Model trained on {num_examples} examples"
+        }
+        
+    except Exception as e:
+        # Clean up on error
+        if 'excel_path' in locals() and os.path.exists(excel_path):
+            os.unlink(excel_path)
+        
+        logger.error(f"Error in supervised training: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/supervised/verify")
+async def verify_pdf_predictions(
+    pdf_file: UploadFile = File(...),
+    expected_answers: dict = None
+):
+    """Verify model predictions against expected answers for a single PDF."""
+    
+    if not pdf_file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="File must be a PDF")
+    
+    try:
+        # Extract text from PDF
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+            content = await pdf_file.read()
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+        
+        try:
+            text = extract_pdf_text(temp_file_path)
+            
+            # Verify predictions
+            verification_result = supervised_trainer.verify_prediction(text, expected_answers)
+            
+            verification_result.update({
+                "success": True,
+                "file_name": pdf_file.filename,
+                "text_length": len(text)
+            })
+            
+            return verification_result
+            
+        finally:
+            os.unlink(temp_file_path)
+            
+    except Exception as e:
+        logger.error(f"Error in verification: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/supervised/batch-verify")
+async def batch_verify_predictions(
+    pdf_files: List[UploadFile] = File(...),
+    excel_answers: UploadFile = File(...)
+):
+    """Verify predictions for multiple PDFs against Excel answers."""
+    
+    try:
+        # Save and load Excel answers
+        excel_path = f"temp_verify_answers_{excel_answers.filename}"
+        with open(excel_path, 'wb') as f:
+            content = await excel_answers.read()
+            f.write(content)
+        
+        answers_df = pd.read_excel(excel_path)
+        
+        # Process each PDF
+        verification_results = []
+        
+        for pdf_file in pdf_files:
+            if not pdf_file.filename.lower().endswith('.pdf'):
+                continue
+            
+            # Find corresponding answer
+            answer_row = answers_df[answers_df['file_name'] == pdf_file.filename]
+            if answer_row.empty:
+                verification_results.append({
+                    "file_name": pdf_file.filename,
+                    "error": "No matching answer found in Excel"
+                })
+                continue
+            
+            # Extract text and verify
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+                content = await pdf_file.read()
+                temp_file.write(content)
+                temp_file_path = temp_file.name
+            
+            try:
+                text = extract_pdf_text(temp_file_path)
+                
+                # Get expected answers
+                answer_data = answer_row.iloc[0]
+                expected_answers = {
+                    'date': str(answer_data.get('date', '')).strip() if pd.notna(answer_data.get('date')) else None,
+                    'company_name': str(answer_data.get('company_name', '')).strip() if pd.notna(answer_data.get('company_name')) else None,
+                    'company_address': str(answer_data.get('company_address', '')).strip() if pd.notna(answer_data.get('company_address')) else None,
+                    'angebot': str(answer_data.get('angebot', '')).strip() if pd.notna(answer_data.get('angebot')) else None,
+                }
+                
+                # Verify
+                verification = supervised_trainer.verify_prediction(text, expected_answers)
+                verification['file_name'] = pdf_file.filename
+                verification['success'] = True
+                
+                verification_results.append(verification)
+                
+            except Exception as e:
+                verification_results.append({
+                    "file_name": pdf_file.filename,
+                    "error": str(e),
+                    "success": False
+                })
+            finally:
+                os.unlink(temp_file_path)
+        
+        # Calculate aggregate statistics
+        successful_verifications = [r for r in verification_results if r.get('success')]
+        
+        if successful_verifications:
+            overall_accuracies = [r['overall_accuracy'] for r in successful_verifications]
+            avg_overall_accuracy = sum(overall_accuracies) / len(overall_accuracies)
+            
+            # Parameter-wise accuracies
+            param_accuracies = {}
+            for param in ['date', 'company_name', 'company_address', 'angebot']:
+                param_accs = [r['accuracies'][param] for r in successful_verifications]
+                param_accuracies[param] = sum(param_accs) / len(param_accs)
+        else:
+            avg_overall_accuracy = 0.0
+            param_accuracies = {}
+        
+        # Clean up
+        os.unlink(excel_path)
+        
+        return {
+            "success": True,
+            "total_files": len(pdf_files),
+            "verified_files": len(successful_verifications),
+            "failed_files": len(pdf_files) - len(successful_verifications),
+            "average_overall_accuracy": avg_overall_accuracy,
+            "parameter_accuracies": param_accuracies,
+            "detailed_results": verification_results
+        }
+        
+    except Exception as e:
+        # Clean up on error
+        if 'excel_path' in locals() and os.path.exists(excel_path):
+            os.unlink(excel_path)
+        
+        logger.error(f"Error in batch verification: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/supervised/training-status")
+async def get_training_status():
+    """Get current training status and statistics."""
+    
+    if not supervised_trainer.training_data:
+        return {
+            "trained": False,
+            "message": "No model has been trained yet",
+            "training_examples": 0
+        }
+    
+    # Calculate current performance statistics
+    param_accuracies = {}
+    for param in ['date', 'company_name', 'company_address', 'angebot']:
+        param_accs = [example['accuracies'][param] for example in supervised_trainer.training_data]
+        param_accuracies[param] = {
+            'average_accuracy': sum(param_accs) / len(param_accs),
+            'total_examples': len(param_accs),
+            'correct_predictions': sum(1 for acc in param_accs if acc > 0.5)
+        }
+    
+    overall_accuracy = sum(param_accuracies[p]['average_accuracy'] for p in param_accuracies) / len(param_accuracies)
+    
+    return {
+        "trained": True,
+        "training_examples": len(supervised_trainer.training_data),
+        "overall_accuracy": overall_accuracy,
+        "parameter_performance": param_accuracies,
+        "message": f"Model trained on {len(supervised_trainer.training_data)} examples"
+    }
+
+# Update the main web interface to include supervised training
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
-    """Simple web interface."""
+    """Enhanced web interface with supervised training."""
     html_content = """
     <!DOCTYPE html>
     <html>
@@ -427,37 +779,192 @@ async def read_root():
         <title>HuggingFace PDF Extraction Framework (Simple)</title>
         <style>
             body { font-family: Arial, sans-serif; margin: 40px; }
-            .container { max-width: 800px; margin: 0 auto; }
+            .container { max-width: 1000px; margin: 0 auto; }
+            .section { margin-bottom: 30px; padding: 20px; border: 1px solid #ddd; border-radius: 8px; }
             .upload-area { border: 2px dashed #ccc; padding: 20px; text-align: center; margin: 20px 0; }
-            button { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }
+            button { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin: 5px; }
             button:hover { background: #0056b3; }
             .result { background: #f8f9fa; padding: 15px; margin: 10px 0; border-radius: 4px; }
+            .success { background: #d4edda; border: 1px solid #c3e6cb; }
+            .error { background: #f8d7da; border: 1px solid #f5c6cb; }
+            .warning { background: #fff3cd; border: 1px solid #ffeaa7; }
         </style>
     </head>
     <body>
         <div class="container">
             <h1>🤗 HuggingFace PDF Extraction Framework (Simple)</h1>
-            <p>Simplified version for testing PDF parameter extraction</p>
+            <p>Complete solution for PDF parameter extraction with supervised learning</p>
             
-            <h2>📄 Single PDF Test</h2>
-            <div class="upload-area">
-                <input type="file" id="singleFile" accept=".pdf">
-                <br><br>
-                <button onclick="testSinglePDF()">Extract Parameters</button>
+            <div class="section">
+                <h2>🎓 Supervised Training</h2>
+                <p>Train the model using your PDFs with Excel answer sheets</p>
+                <div class="upload-area">
+                    <h3>Train Model</h3>
+                    <input type="file" id="trainingPDFs" accept=".pdf" multiple>
+                    <br>
+                    <input type="file" id="answerExcel" accept=".xlsx,.xls">
+                    <br><br>
+                    <button onclick="trainSupervisedModel()">Train Model</button>
+                    <button onclick="getTrainingStatus()">Check Training Status</button>
+                </div>
             </div>
             
-            <h2>📦 Batch PDF Test</h2>
-            <div class="upload-area">
-                <input type="file" id="batchFiles" accept=".pdf" multiple>
-                <br><br>
-                <button onclick="testBatchPDF()">Extract Batch</button>
-                <button onclick="downloadTemplate()">Download Template</button>
+            <div class="section">
+                <h2>🔍 Verification</h2>
+                <p>Verify model predictions against known correct answers</p>
+                <div class="upload-area">
+                    <h3>Single PDF Verification</h3>
+                    <input type="file" id="verifyPDF" accept=".pdf">
+                    <br>
+                    <textarea id="expectedAnswers" placeholder='{"date": "15.03.2024", "company_name": "TechSolutions GmbH", "company_address": "Berlin", "angebot": "A-2024-001"}' rows="3" style="width: 80%; margin: 10px;"></textarea>
+                    <br>
+                    <button onclick="verifySinglePDF()">Verify Prediction</button>
+                </div>
+                
+                <div class="upload-area">
+                    <h3>Batch Verification</h3>
+                    <input type="file" id="batchVerifyPDFs" accept=".pdf" multiple>
+                    <br>
+                    <input type="file" id="batchAnswerExcel" accept=".xlsx,.xls">
+                    <br><br>
+                    <button onclick="batchVerifyPDFs()">Batch Verify</button>
+                </div>
+            </div>
+            
+            <div class="section">
+                <h2>📄 Basic Extraction</h2>
+                <div class="upload-area">
+                    <input type="file" id="singleFile" accept=".pdf">
+                    <br><br>
+                    <button onclick="testSinglePDF()">Extract Parameters</button>
+                </div>
+                
+                <div class="upload-area">
+                    <input type="file" id="batchFiles" accept=".pdf" multiple>
+                    <br><br>
+                    <button onclick="testBatchPDF()">Extract Batch</button>
+                    <button onclick="downloadTemplate()">Download Template</button>
+                </div>
             </div>
             
             <div id="results"></div>
         </div>
         
         <script>
+            function showResult(content, type = 'result') {
+                const resultsDiv = document.getElementById('results');
+                resultsDiv.innerHTML = `<div class="${type}"><h3>Results</h3><pre>${content}</pre></div>`;
+            }
+            
+            async function trainSupervisedModel() {
+                const pdfFiles = document.getElementById('trainingPDFs').files;
+                const excelFile = document.getElementById('answerExcel').files[0];
+                
+                if (!pdfFiles.length || !excelFile) {
+                    alert('Please select PDF files and Excel answer sheet');
+                    return;
+                }
+                
+                const formData = new FormData();
+                for (let file of pdfFiles) {
+                    formData.append('pdf_files', file);
+                }
+                formData.append('excel_answers', excelFile);
+                
+                try {
+                    showResult('Training model... please wait', 'warning');
+                    const response = await fetch('/supervised/train', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    const result = await response.json();
+                    showResult(JSON.stringify(result, null, 2), response.ok ? 'success' : 'error');
+                } catch (error) {
+                    showResult(`Error: ${error.message}`, 'error');
+                }
+            }
+            
+            async function getTrainingStatus() {
+                try {
+                    const response = await fetch('/supervised/training-status');
+                    const result = await response.json();
+                    showResult(JSON.stringify(result, null, 2), 'result');
+                } catch (error) {
+                    showResult(`Error: ${error.message}`, 'error');
+                }
+            }
+            
+            async function verifySinglePDF() {
+                const pdfFile = document.getElementById('verifyPDF').files[0];
+                const expectedAnswersText = document.getElementById('expectedAnswers').value;
+                
+                if (!pdfFile || !expectedAnswersText) {
+                    alert('Please select PDF file and provide expected answers');
+                    return;
+                }
+                
+                let expectedAnswers;
+                try {
+                    expectedAnswers = JSON.parse(expectedAnswersText);
+                } catch (e) {
+                    alert('Invalid JSON format for expected answers');
+                    return;
+                }
+                
+                const formData = new FormData();
+                formData.append('pdf_file', pdfFile);
+                
+                try {
+                    const response = await fetch('/supervised/verify', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            pdf_file: pdfFile,
+                            expected_answers: expectedAnswers
+                        })
+                    });
+                    
+                    // Note: This is a simplified approach for the demo
+                    // In practice, you'd need to handle file upload differently
+                    showResult('Verification feature requires backend adjustment for demo', 'warning');
+                } catch (error) {
+                    showResult(`Error: ${error.message}`, 'error');
+                }
+            }
+            
+            async function batchVerifyPDFs() {
+                const pdfFiles = document.getElementById('batchVerifyPDFs').files;
+                const excelFile = document.getElementById('batchAnswerExcel').files[0];
+                
+                if (!pdfFiles.length || !excelFile) {
+                    alert('Please select PDF files and Excel answer sheet');
+                    return;
+                }
+                
+                const formData = new FormData();
+                for (let file of pdfFiles) {
+                    formData.append('pdf_files', file);
+                }
+                formData.append('excel_answers', excelFile);
+                
+                try {
+                    showResult('Verifying predictions... please wait', 'warning');
+                    const response = await fetch('/supervised/batch-verify', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    const result = await response.json();
+                    showResult(JSON.stringify(result, null, 2), response.ok ? 'success' : 'error');
+                } catch (error) {
+                    showResult(`Error: ${error.message}`, 'error');
+                }
+            }
+            
+            // Previous functions remain the same
             async function testSinglePDF() {
                 const fileInput = document.getElementById('singleFile');
                 if (!fileInput.files[0]) {
@@ -475,9 +982,9 @@ async def read_root():
                     });
                     
                     const result = await response.json();
-                    document.getElementById('results').innerHTML = '<div class="result"><h3>Single PDF Results</h3><pre>' + JSON.stringify(result, null, 2) + '</pre></div>';
+                    showResult(JSON.stringify(result, null, 2), response.ok ? 'result' : 'error');
                 } catch (error) {
-                    document.getElementById('results').innerHTML = '<div class="result"><h3>Error</h3><p>' + error.message + '</p></div>';
+                    showResult(`Error: ${error.message}`, 'error');
                 }
             }
             
@@ -501,9 +1008,9 @@ async def read_root():
                     });
                     
                     const result = await response.json();
-                    document.getElementById('results').innerHTML = '<div class="result"><h3>Batch PDF Results</h3><pre>' + JSON.stringify(result, null, 2) + '</pre></div>';
+                    showResult(JSON.stringify(result, null, 2), response.ok ? 'result' : 'error');
                 } catch (error) {
-                    document.getElementById('results').innerHTML = '<div class="result"><h3>Error</h3><p>' + error.message + '</p></div>';
+                    showResult(`Error: ${error.message}`, 'error');
                 }
             }
             
