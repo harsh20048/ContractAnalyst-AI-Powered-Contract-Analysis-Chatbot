@@ -37,6 +37,7 @@ from hf_framework.training_pipeline import TrainingPipeline, TrainingConfig
 import zipfile
 import io
 import pandas as pd
+from hf_framework.mistral_pipeline import MistralPipeline, MistralConfig, ExtractionResult
 
 # Configure logging
 logging.basicConfig(
@@ -72,6 +73,9 @@ app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 # Global processing status
 processing_status: Dict[str, Dict[str, Any]] = {}
+
+# Global Mistral pipeline (initialize once)
+mistral_pipeline: Optional[MistralPipeline] = None
 
 
 # Pydantic models for API
@@ -1183,10 +1187,381 @@ async def download_training_results(job_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Mistral integration endpoints
+@app.post("/mistral/load")
+async def load_mistral_model(
+    model_path: str = "./mistral-7b-instruct-v0.1",
+    load_in_4bit: bool = True,
+    max_new_tokens: int = 512
+):
+    """Load Mistral 7B model with optimizations."""
+    global mistral_pipeline
+    
+    try:
+        config = MistralConfig(
+            model_path=model_path,
+            load_in_4bit=load_in_4bit,
+            max_new_tokens=max_new_tokens
+        )
+        
+        mistral_pipeline = MistralPipeline(config)
+        
+        success = mistral_pipeline.load_model()
+        
+        if success:
+            stats = mistral_pipeline.get_performance_stats()
+            return {
+                "success": True,
+                "message": "Mistral 7B loaded successfully",
+                "model_path": model_path,
+                "config": {
+                    "load_in_4bit": load_in_4bit,
+                    "max_new_tokens": max_new_tokens
+                },
+                "system_info": stats.get("model_config", {})
+            }
+        else:
+            return {
+                "success": False,
+                "message": "Failed to load Mistral 7B model",
+                "error": "Model loading failed"
+            }
+            
+    except Exception as e:
+        logger.error(f"Error loading Mistral 7B: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/mistral/extract")
+async def extract_with_mistral(file: UploadFile = File(...)):
+    """Extract parameters using Mistral 7B model."""
+    global mistral_pipeline
+    
+    if not mistral_pipeline or not mistral_pipeline.model:
+        raise HTTPException(
+            status_code=400, 
+            detail="Mistral 7B model not loaded. Use /mistral/load first."
+        )
+    
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="File must be a PDF")
+    
+    try:
+        # Save uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+            content = await file.read()
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+        
+        try:
+            # Extract using Mistral 7B
+            result = mistral_pipeline.extract_from_pdf(temp_file_path)
+            
+            if result.success:
+                return {
+                    "success": True,
+                    "file_name": file.filename,
+                    "extracted_parameters": result.extracted_parameters,
+                    "confidence_scores": result.confidence_scores,
+                    "processing_time": result.processing_time,
+                    "token_usage": result.token_usage,
+                    "model_response": result.model_response
+                }
+            else:
+                return {
+                    "success": False,
+                    "file_name": file.filename,
+                    "error": result.error_message
+                }
+                
+        finally:
+            # Clean up temp file
+            os.unlink(temp_file_path)
+            
+    except Exception as e:
+        logger.error(f"Error in Mistral extraction: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/mistral/batch-extract")
+async def batch_extract_with_mistral(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...)
+):
+    """Batch extract parameters using Mistral 7B."""
+    global mistral_pipeline
+    
+    if not mistral_pipeline or not mistral_pipeline.model:
+        raise HTTPException(
+            status_code=400, 
+            detail="Mistral 7B model not loaded. Use /mistral/load first."
+        )
+    
+    try:
+        # Save all files temporarily
+        temp_files = []
+        for file in files:
+            if file.filename.lower().endswith('.pdf'):
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+                    content = await file.read()
+                    temp_file.write(content)
+                    temp_files.append((temp_file.name, file.filename))
+        
+        if not temp_files:
+            raise HTTPException(status_code=400, detail="No valid PDF files found")
+        
+        # Extract from all PDFs
+        results = []
+        
+        for temp_path, original_filename in temp_files:
+            try:
+                result = mistral_pipeline.extract_from_pdf(temp_path)
+                
+                result_dict = {
+                    "file_name": original_filename,
+                    "success": result.success,
+                    "extracted_parameters": result.extracted_parameters,
+                    "confidence_scores": result.confidence_scores,
+                    "processing_time": result.processing_time,
+                    "token_usage": result.token_usage
+                }
+                
+                if not result.success:
+                    result_dict["error"] = result.error_message
+                
+                results.append(result_dict)
+                
+            except Exception as e:
+                results.append({
+                    "file_name": original_filename,
+                    "success": False,
+                    "error": str(e)
+                })
+            finally:
+                # Clean up temp file
+                os.unlink(temp_path)
+        
+        # Calculate summary statistics
+        successful_extractions = [r for r in results if r["success"]]
+        total_processing_time = sum(r.get("processing_time", 0) for r in successful_extractions)
+        total_tokens = sum(r.get("token_usage", {}).get("total_tokens", 0) for r in successful_extractions)
+        
+        # Average confidence scores
+        avg_confidence = {}
+        for param in ["date", "company_name", "company_address", "angebot", "tables"]:
+            param_confidences = [
+                r["confidence_scores"].get(param, 0) 
+                for r in successful_extractions 
+                if "confidence_scores" in r
+            ]
+            avg_confidence[param] = sum(param_confidences) / len(param_confidences) if param_confidences else 0.0
+        
+        return {
+            "success": True,
+            "total_files": len(files),
+            "processed_files": len(results),
+            "successful_extractions": len(successful_extractions),
+            "failed_extractions": len(results) - len(successful_extractions),
+            "total_processing_time": total_processing_time,
+            "total_token_usage": total_tokens,
+            "average_confidence_scores": avg_confidence,
+            "detailed_results": results
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in Mistral batch extraction: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/mistral/status")
+async def get_mistral_status():
+    """Get Mistral 7B model status and performance."""
+    global mistral_pipeline
+    
+    if not mistral_pipeline:
+        return {
+            "loaded": False,
+            "message": "Mistral 7B pipeline not initialized"
+        }
+    
+    if not mistral_pipeline.model:
+        return {
+            "loaded": False,
+            "message": "Mistral 7B model not loaded"
+        }
+    
+    try:
+        stats = mistral_pipeline.get_performance_stats()
+        
+        return {
+            "loaded": True,
+            "model_path": mistral_pipeline.config.model_path,
+            "performance_stats": stats,
+            "config": {
+                "load_in_4bit": mistral_pipeline.config.load_in_4bit,
+                "max_new_tokens": mistral_pipeline.config.max_new_tokens,
+                "temperature": mistral_pipeline.config.temperature,
+                "torch_dtype": str(mistral_pipeline.config.torch_dtype)
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting Mistral status: {str(e)}")
+        return {
+            "loaded": True,
+            "error": str(e)
+        }
+
+
+@app.post("/mistral/unload")
+async def unload_mistral_model():
+    """Unload Mistral 7B model to free memory."""
+    global mistral_pipeline
+    
+    if not mistral_pipeline:
+        return {
+            "success": True,
+            "message": "No model was loaded"
+        }
+    
+    try:
+        mistral_pipeline.unload_model()
+        mistral_pipeline = None
+        
+        return {
+            "success": True,
+            "message": "Mistral 7B model unloaded successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error unloading Mistral: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/mistral/supervised-train")
+async def train_mistral_supervised(
+    pdf_files: List[UploadFile] = File(...),
+    excel_answers: UploadFile = File(...)
+):
+    """Train using Mistral 7B predictions + Excel ground truth."""
+    global mistral_pipeline
+    
+    if not mistral_pipeline or not mistral_pipeline.model:
+        raise HTTPException(
+            status_code=400, 
+            detail="Mistral 7B model not loaded. Use /mistral/load first."
+        )
+    
+    try:
+        # Save and load Excel answers
+        excel_path = f"temp_mistral_answers_{excel_answers.filename}"
+        with open(excel_path, 'wb') as f:
+            content = await excel_answers.read()
+            f.write(content)
+        
+        answers_df = pd.read_excel(excel_path)
+        
+        # Process PDFs with Mistral 7B and compare with Excel
+        training_results = []
+        
+        for pdf_file in pdf_files:
+            if not pdf_file.filename.lower().endswith('.pdf'):
+                continue
+            
+            # Find corresponding answer
+            answer_row = answers_df[answers_df['file_name'] == pdf_file.filename]
+            if answer_row.empty:
+                continue
+            
+            # Extract with Mistral 7B
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+                content = await pdf_file.read()
+                temp_file.write(content)
+                temp_file_path = temp_file.name
+            
+            try:
+                # Get Mistral predictions
+                mistral_result = mistral_pipeline.extract_from_pdf(temp_file_path)
+                
+                if mistral_result.success:
+                    # Get expected answers
+                    answer_data = answer_row.iloc[0]
+                    expected_answers = {
+                        'date': str(answer_data.get('date', '')).strip() if pd.notna(answer_data.get('date')) else None,
+                        'company_name': str(answer_data.get('company_name', '')).strip() if pd.notna(answer_data.get('company_name')) else None,
+                        'company_address': str(answer_data.get('company_address', '')).strip() if pd.notna(answer_data.get('company_address')) else None,
+                        'angebot': str(answer_data.get('angebot', '')).strip() if pd.notna(answer_data.get('angebot')) else None,
+                    }
+                    
+                    # Calculate accuracy for each parameter
+                    accuracies = {}
+                    for param in ['date', 'company_name', 'company_address', 'angebot']:
+                        expected = expected_answers.get(param)
+                        predicted = mistral_result.extracted_parameters.get(param)
+                        
+                        if expected and predicted:
+                            # String similarity
+                            accuracy = 1.0 if (str(expected).lower() in str(predicted).lower() or 
+                                             str(predicted).lower() in str(expected).lower()) else 0.0
+                        else:
+                            accuracy = 1.0 if (not expected and not predicted) else 0.0
+                        
+                        accuracies[param] = accuracy
+                    
+                    training_results.append({
+                        'file_name': pdf_file.filename,
+                        'mistral_predictions': mistral_result.extracted_parameters,
+                        'expected_answers': expected_answers,
+                        'accuracies': accuracies,
+                        'mistral_confidence': mistral_result.confidence_scores,
+                        'processing_time': mistral_result.processing_time
+                    })
+                    
+            finally:
+                os.unlink(temp_file_path)
+        
+        # Calculate overall statistics
+        if training_results:
+            param_accuracies = {}
+            for param in ['date', 'company_name', 'company_address', 'angebot']:
+                param_accs = [r['accuracies'][param] for r in training_results]
+                param_accuracies[param] = sum(param_accs) / len(param_accs)
+            
+            overall_accuracy = sum(param_accuracies.values()) / len(param_accuracies)
+            avg_processing_time = sum(r['processing_time'] for r in training_results) / len(training_results)
+        else:
+            param_accuracies = {}
+            overall_accuracy = 0.0
+            avg_processing_time = 0.0
+        
+        # Clean up
+        os.unlink(excel_path)
+        
+        return {
+            "success": True,
+            "training_examples": len(training_results),
+            "matched_pdfs": len(training_results),
+            "total_pdfs": len(pdf_files),
+            "overall_accuracy": overall_accuracy,
+            "parameter_accuracies": param_accuracies,
+            "average_processing_time": avg_processing_time,
+            "detailed_results": training_results[:5],  # First 5 for brevity
+            "message": f"Mistral 7B supervised training completed on {len(training_results)} examples"
+        }
+        
+    except Exception as e:
+        # Clean up on error
+        if 'excel_path' in locals() and os.path.exists(excel_path):
+            os.unlink(excel_path)
+        
+        logger.error(f"Error in Mistral supervised training: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # Startup event
 @app.on_event("startup")
 async def startup_event():
-    """Application startup tasks."""
+    """Initialize application components."""
     logger.info(f"Starting {settings.app_name} v{settings.app_version}")
     logger.info(f"Debug mode: {settings.debug}")
     
@@ -1201,6 +1576,11 @@ async def startup_event():
     
     # Optionally warm up default models
     # extraction_engine.warm_up(["summarization"])
+
+    # Initialize Mistral pipeline (but don't load model yet)
+    global mistral_pipeline
+    logger.info("🚀 Mistral 7B pipeline initialized (model not loaded)")
+    logger.info("Use POST /mistral/load to load the model when ready")
 
 
 # Shutdown event
