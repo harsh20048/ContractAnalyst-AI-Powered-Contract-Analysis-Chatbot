@@ -1,0 +1,29 @@
+{
+  "project_name": "Mistral PDF Extractor",
+  "version": "1.0.0",
+  "supported_formats": [
+    ".pdf"
+  ],
+  "extraction_parameters": [
+    "date",
+    "company_name",
+    "company_address",
+    "angebot",
+    "tables"
+  ],
+  "model_configs": {
+    "mistral-7b": {
+      "path": "./models/mistral-7b-instruct-v0.1",
+      "type": "causal-lm",
+      "quantization": "4bit",
+      "max_memory": "auto"
+    }
+  },
+  "directories": {
+    "data": "./data",
+    "models": "./models",
+    "logs": "./logs",
+    "uploads": "./uploads",
+    "outputs": "./outputs"
+  }
+}

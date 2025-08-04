@@ -1,0 +1,38 @@
+INFO:     Started server process [9232]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:52978 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52526 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52528 - "GET /supervised/training-status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52536 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52538 - "GET /config/tasks HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40914 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40918 - "GET /supervised/training-status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40930 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40944 - "GET /config/tasks HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40958 - "GET /supervised/training-status HTTP/1.1" 200 OK
+WARNING:PyPDF2._reader:incorrect startxref pointer(1)
+ERROR:__main__:Error extracting PDF text: Stream has ended unexpectedly
+WARNING:PyPDF2._reader:incorrect startxref pointer(1)
+ERROR:__main__:Error extracting PDF text: Stream has ended unexpectedly
+WARNING:PyPDF2._reader:incorrect startxref pointer(3)
+ERROR:__main__:Error extracting PDF text: Stream has ended unexpectedly
+🤖 Training models with supervised learning...
+   ✅ Trained on 0 examples
+INFO:     127.0.0.1:40970 - "POST /supervised/train HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40984 - "GET /supervised/training-status HTTP/1.1" 200 OK
+WARNING:PyPDF2._reader:incorrect startxref pointer(1)
+ERROR:__main__:Error extracting PDF text: Stream has ended unexpectedly
+WARNING:PyPDF2._reader:incorrect startxref pointer(1)
+ERROR:__main__:Error extracting PDF text: Stream has ended unexpectedly
+WARNING:PyPDF2._reader:incorrect startxref pointer(3)
+ERROR:__main__:Error extracting PDF text: Stream has ended unexpectedly
+INFO:     127.0.0.1:40994 - "POST /supervised/batch-verify HTTP/1.1" 200 OK
+WARNING:PyPDF2._reader:incorrect startxref pointer(1)
+ERROR:__main__:Error extracting PDF text: Stream has ended unexpectedly
+INFO:     127.0.0.1:40998 - "POST /training/extract-single HTTP/1.1" 200 OK
+WARNING:PyPDF2._reader:incorrect startxref pointer(1)
+ERROR:__main__:Error extracting PDF text: Stream has ended unexpectedly
+INFO:     127.0.0.1:41010 - "POST /training/extract-single HTTP/1.1" 200 OK
+INFO:     127.0.0.1:42044 - "GET /supervised/training-status HTTP/1.1" 200 OK
