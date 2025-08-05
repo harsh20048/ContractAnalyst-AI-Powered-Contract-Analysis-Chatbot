@@ -12,3 +12,5 @@ google-auth-oauthlib
 google-auth-httplib2
 streamlit
 faiss-cpu
+pandas
+numpy
