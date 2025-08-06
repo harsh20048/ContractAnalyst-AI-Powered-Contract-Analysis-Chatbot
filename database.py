@@ -1,585 +1,345 @@
-#!/usr/bin/env python3
 """
-Database Management Module for PDF Table Extraction System
-===========================================================
+Database Manager Module for PDF Table Extraction System
+======================================================
 
-Comprehensive database operations for storing document corrections,
-learned patterns, system statistics, and processing logs.
+Comprehensive database management module for handling:
+- Document corrections storage and retrieval
+- Pattern learning data management
+- System statistics and analytics
+- Database maintenance and optimization
+- Backup and recovery operations
 
 Author: AI Assistant
-Version: 3.0.0
+Version: 2.0.0
 License: MIT
 """
 
 import sqlite3
 import json
-import hashlib
 import logging
+import os
+import shutil
+import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple, Union
 from pathlib import Path
-import threading
-import os
-import shutil
+import hashlib
+import pickle
+import gzip
 from contextlib import contextmanager
-import time
-import uuid
 from dataclasses import dataclass, asdict
-from enum import Enum
+import pandas as pd
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
-# Constants
-DATABASE_VERSION = "3.0.0"
-BACKUP_RETENTION_DAYS = 30
-MAX_LOG_ENTRIES = 10000
-CLEANUP_INTERVAL_DAYS = 7
+@dataclass
+class DocumentRecord:
+    """Data class for document records"""
+    document_hash: str
+    filename: str
+    file_size: int
+    upload_date: datetime
+    last_modified: datetime
+    fields: Dict[str, Any]
+    tables: List[Dict[str, Any]]
+    metadata: Dict[str, Any]
+    extraction_confidence: float = 0.0
+    processing_time: float = 0.0
+    correction_count: int = 0
+
+@dataclass
+class PatternRecord:
+    """Data class for pattern learning records"""
+    pattern_id: str
+    pattern_type: str  # 'field' or 'table'
+    pattern_data: Dict[str, Any]
+    confidence: float
+    usage_count: int
+    success_rate: float
+    created_date: datetime
+    last_used: datetime
+    metadata: Dict[str, Any]
 
 class DatabaseError(Exception):
     """Custom exception for database operations"""
     pass
 
-class BackupError(Exception):
-    """Custom exception for backup operations"""
-    pass
-
-@dataclass
-class DocumentCorrection:
-    """Document correction data structure"""
-    hash: str
-    filename: str
-    field_data: Dict[str, Any]
-    table_data: List[Dict[str, Any]]
-    engine: str
-    confidence: float
-    created_at: datetime
-    updated_at: datetime
-    version: int = 1
-    metadata: Optional[Dict[str, Any]] = None
-
-@dataclass
-class PatternData:
-    """Pattern learning data structure"""
-    pattern_id: str
-    pattern_type: str
-    pattern_data: Dict[str, Any]
-    success_count: int
-    usage_count: int
-    confidence: float
-    created_at: datetime
-    updated_at: datetime
-
-@dataclass
-class ProcessingLog:
-    """Processing log data structure"""
-    log_id: str
-    document_hash: str
-    operation: str
-    status: str
-    engine: str
-    processing_time: float
-    error_message: Optional[str]
-    created_at: datetime
-    metadata: Optional[Dict[str, Any]] = None
-
 class DatabaseManager:
-    """Comprehensive database management with advanced features"""
+    """Comprehensive database manager for PDF extraction system"""
     
-    def __init__(self, db_path: str = "pdf_extraction.db", backup_dir: str = "backups"):
+    def __init__(self, db_path: str = "pdf_extraction.db"):
         """
         Initialize database manager
         
         Args:
             db_path: Path to SQLite database file
-            backup_dir: Directory for database backups
         """
         self.db_path = db_path
-        self.backup_dir = Path(backup_dir)
-        self.backup_dir.mkdir(exist_ok=True)
+        self.connection_pool = {}
+        self.lock = threading.RLock()
+        self._initialize_database()
         
-        # Thread safety
-        self._lock = threading.RLock()
-        self._connection_pool = {}
-        
-        # Initialize database
-        self.init_database()
-        
-        # Setup automatic cleanup
-        self._setup_cleanup_schedule()
-        
-        logger.info(f"DatabaseManager initialized with database: {db_path}")
-    
-    def init_database(self):
-        """Initialize database with all required tables and indexes"""
+    def _initialize_database(self):
+        """Initialize database with required tables"""
         try:
-            with self._get_connection() as conn:
+            with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
-                # Create tables
-                self._create_document_corrections_table(cursor)
-                self._create_field_corrections_table(cursor)
-                self._create_table_corrections_table(cursor)
-                self._create_pattern_learning_table(cursor)
-                self._create_system_stats_table(cursor)
-                self._create_processing_logs_table(cursor)
-                self._create_backup_metadata_table(cursor)
-                self._create_user_sessions_table(cursor)
+                # Document corrections table
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS document_corrections (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        document_hash TEXT UNIQUE NOT NULL,
+                        filename TEXT NOT NULL,
+                        file_size INTEGER NOT NULL,
+                        upload_date TIMESTAMP NOT NULL,
+                        last_modified TIMESTAMP NOT NULL,
+                        fields TEXT NOT NULL,
+                        tables TEXT NOT NULL,
+                        metadata TEXT,
+                        extraction_confidence REAL DEFAULT 0.0,
+                        processing_time REAL DEFAULT 0.0,
+                        correction_count INTEGER DEFAULT 0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
                 
-                # Create indexes for performance
-                self._create_indexes(cursor)
+                # Field corrections table for detailed tracking
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS field_corrections (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        document_hash TEXT NOT NULL,
+                        field_name TEXT NOT NULL,
+                        original_value TEXT,
+                        corrected_value TEXT NOT NULL,
+                        correction_type TEXT DEFAULT 'manual',
+                        confidence REAL DEFAULT 1.0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (document_hash) REFERENCES document_corrections(document_hash)
+                    )
+                """)
                 
-                # Create triggers for automatic updates
-                self._create_triggers(cursor)
+                # Table corrections table for detailed tracking
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS table_corrections (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        document_hash TEXT NOT NULL,
+                        table_name TEXT NOT NULL,
+                        table_index INTEGER NOT NULL,
+                        original_data TEXT,
+                        corrected_data TEXT NOT NULL,
+                        correction_type TEXT DEFAULT 'manual',
+                        confidence REAL DEFAULT 1.0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (document_hash) REFERENCES document_corrections(document_hash)
+                    )
+                """)
                 
-                # Insert initial system data
-                self._insert_initial_data(cursor)
+                # Pattern learning table
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS pattern_learning (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        pattern_id TEXT UNIQUE NOT NULL,
+                        pattern_type TEXT NOT NULL CHECK (pattern_type IN ('field', 'table')),
+                        pattern_name TEXT NOT NULL,
+                        pattern_data TEXT NOT NULL,
+                        confidence REAL DEFAULT 0.0,
+                        usage_count INTEGER DEFAULT 0,
+                        success_rate REAL DEFAULT 0.0,
+                        created_date TIMESTAMP NOT NULL,
+                        last_used TIMESTAMP,
+                        metadata TEXT,
+                        is_active BOOLEAN DEFAULT 1,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # System statistics table
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS system_stats (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        stat_name TEXT UNIQUE NOT NULL,
+                        stat_value TEXT NOT NULL,
+                        stat_type TEXT DEFAULT 'counter',
+                        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # Processing logs table
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS processing_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        document_hash TEXT,
+                        operation_type TEXT NOT NULL,
+                        operation_status TEXT NOT NULL,
+                        processing_time REAL,
+                        error_message TEXT,
+                        metadata TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # Create indexes for better performance
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_document_hash ON document_corrections(document_hash)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_filename ON document_corrections(filename)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_upload_date ON document_corrections(upload_date)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_field_corrections_hash ON field_corrections(document_hash)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_table_corrections_hash ON table_corrections(document_hash)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_pattern_type ON pattern_learning(pattern_type)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_pattern_active ON pattern_learning(is_active)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_processing_logs_hash ON processing_logs(document_hash)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_processing_logs_type ON processing_logs(operation_type)")
+                
+                # Initialize system stats
+                self._initialize_system_stats(cursor)
                 
                 conn.commit()
                 logger.info("Database initialized successfully")
                 
         except Exception as e:
-            logger.error(f"Database initialization failed: {str(e)}")
-            raise DatabaseError(f"Failed to initialize database: {str(e)}")
+            logger.error(f"Database initialization failed: {e}")
+            raise DatabaseError(f"Failed to initialize database: {e}")
     
-    def _create_document_corrections_table(self, cursor):
-        """Create document corrections table"""
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS document_corrections (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_hash TEXT UNIQUE NOT NULL,
-                filename TEXT NOT NULL,
-                original_field_data TEXT,
-                corrected_field_data TEXT,
-                original_table_data TEXT,
-                corrected_table_data TEXT,
-                extraction_engine TEXT,
-                extraction_confidence REAL,
-                correction_count INTEGER DEFAULT 0,
-                validation_status TEXT DEFAULT 'pending',
-                processing_time REAL,
-                file_size INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                version INTEGER DEFAULT 1,
-                metadata TEXT,
-                user_id TEXT,
-                tags TEXT,
-                status TEXT DEFAULT 'active'
-            )
-        """)
-    
-    def _create_field_corrections_table(self, cursor):
-        """Create field corrections table for detailed tracking"""
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS field_corrections (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_hash TEXT NOT NULL,
-                field_name TEXT NOT NULL,
-                original_value TEXT,
-                corrected_value TEXT,
-                correction_type TEXT,
-                confidence REAL,
-                validation_result TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                user_id TEXT,
-                FOREIGN KEY (document_hash) REFERENCES document_corrections (document_hash)
-            )
-        """)
-    
-    def _create_table_corrections_table(self, cursor):
-        """Create table corrections table for detailed tracking"""
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS table_corrections (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_hash TEXT NOT NULL,
-                table_index INTEGER,
-                row_index INTEGER,
-                column_name TEXT,
-                original_value TEXT,
-                corrected_value TEXT,
-                correction_type TEXT,
-                confidence REAL,
-                validation_result TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                user_id TEXT,
-                FOREIGN KEY (document_hash) REFERENCES document_corrections (document_hash)
-            )
-        """)
-    
-    def _create_pattern_learning_table(self, cursor):
-        """Create pattern learning table"""
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS pattern_learning (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pattern_id TEXT UNIQUE NOT NULL,
-                pattern_type TEXT NOT NULL,
-                pattern_name TEXT,
-                pattern_data TEXT NOT NULL,
-                field_patterns TEXT,
-                table_patterns TEXT,
-                success_count INTEGER DEFAULT 0,
-                usage_count INTEGER DEFAULT 0,
-                confidence REAL DEFAULT 0.0,
-                accuracy REAL DEFAULT 0.0,
-                last_used TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                version INTEGER DEFAULT 1,
-                metadata TEXT,
-                is_active BOOLEAN DEFAULT 1,
-                source_documents TEXT
-            )
-        """)
-    
-    def _create_system_stats_table(self, cursor):
-        """Create system statistics table"""
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS system_stats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                stat_name TEXT UNIQUE NOT NULL,
-                stat_value TEXT NOT NULL,
-                stat_type TEXT NOT NULL,
-                description TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-    
-    def _create_processing_logs_table(self, cursor):
-        """Create processing logs table"""
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS processing_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                log_id TEXT UNIQUE NOT NULL,
-                document_hash TEXT,
-                operation TEXT NOT NULL,
-                status TEXT NOT NULL,
-                engine TEXT,
-                processing_time REAL,
-                memory_usage INTEGER,
-                cpu_usage REAL,
-                error_message TEXT,
-                error_code TEXT,
-                stack_trace TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                metadata TEXT,
-                user_id TEXT,
-                session_id TEXT
-            )
-        """)
-    
-    def _create_backup_metadata_table(self, cursor):
-        """Create backup metadata table"""
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS backup_metadata (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                backup_id TEXT UNIQUE NOT NULL,
-                backup_path TEXT NOT NULL,
-                backup_size INTEGER,
-                backup_type TEXT,
-                compression_ratio REAL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                expires_at TIMESTAMP,
-                metadata TEXT
-            )
-        """)
-    
-    def _create_user_sessions_table(self, cursor):
-        """Create user sessions table"""
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS user_sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT UNIQUE NOT NULL,
-                user_id TEXT,
-                start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                end_time TIMESTAMP,
-                documents_processed INTEGER DEFAULT 0,
-                corrections_made INTEGER DEFAULT 0,
-                session_data TEXT,
-                ip_address TEXT,
-                user_agent TEXT
-            )
-        """)
-    
-    def _create_indexes(self, cursor):
-        """Create database indexes for performance optimization"""
-        indexes = [
-            "CREATE INDEX IF NOT EXISTS idx_document_hash ON document_corrections (document_hash)",
-            "CREATE INDEX IF NOT EXISTS idx_document_created_at ON document_corrections (created_at)",
-            "CREATE INDEX IF NOT EXISTS idx_document_filename ON document_corrections (filename)",
-            "CREATE INDEX IF NOT EXISTS idx_document_status ON document_corrections (status)",
-            
-            "CREATE INDEX IF NOT EXISTS idx_field_document_hash ON field_corrections (document_hash)",
-            "CREATE INDEX IF NOT EXISTS idx_field_name ON field_corrections (field_name)",
-            "CREATE INDEX IF NOT EXISTS idx_field_created_at ON field_corrections (created_at)",
-            
-            "CREATE INDEX IF NOT EXISTS idx_table_document_hash ON table_corrections (document_hash)",
-            "CREATE INDEX IF NOT EXISTS idx_table_created_at ON table_corrections (created_at)",
-            
-            "CREATE INDEX IF NOT EXISTS idx_pattern_type ON pattern_learning (pattern_type)",
-            "CREATE INDEX IF NOT EXISTS idx_pattern_active ON pattern_learning (is_active)",
-            "CREATE INDEX IF NOT EXISTS idx_pattern_confidence ON pattern_learning (confidence)",
-            "CREATE INDEX IF NOT EXISTS idx_pattern_last_used ON pattern_learning (last_used)",
-            
-            "CREATE INDEX IF NOT EXISTS idx_logs_document_hash ON processing_logs (document_hash)",
-            "CREATE INDEX IF NOT EXISTS idx_logs_operation ON processing_logs (operation)",
-            "CREATE INDEX IF NOT EXISTS idx_logs_status ON processing_logs (status)",
-            "CREATE INDEX IF NOT EXISTS idx_logs_created_at ON processing_logs (created_at)",
-            
-            "CREATE INDEX IF NOT EXISTS idx_stats_name ON system_stats (stat_name)",
-            "CREATE INDEX IF NOT EXISTS idx_backup_created_at ON backup_metadata (created_at)",
-            "CREATE INDEX IF NOT EXISTS idx_sessions_start_time ON user_sessions (start_time)",
+    def _initialize_system_stats(self, cursor):
+        """Initialize system statistics"""
+        default_stats = [
+            ('total_documents', '0', 'counter'),
+            ('total_corrections', '0', 'counter'),
+            ('total_patterns', '0', 'counter'),
+            ('database_version', '2.0.0', 'string'),
+            ('last_backup', '', 'timestamp'),
+            ('system_uptime', '', 'timestamp')
         ]
         
-        for index_sql in indexes:
-            cursor.execute(index_sql)
-    
-    def _create_triggers(self, cursor):
-        """Create database triggers for automatic updates"""
-        # Update timestamp trigger for document_corrections
-        cursor.execute("""
-            CREATE TRIGGER IF NOT EXISTS update_document_corrections_timestamp
-            AFTER UPDATE ON document_corrections
-            BEGIN
-                UPDATE document_corrections SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
-            END
-        """)
-        
-        # Update timestamp trigger for pattern_learning
-        cursor.execute("""
-            CREATE TRIGGER IF NOT EXISTS update_pattern_learning_timestamp
-            AFTER UPDATE ON pattern_learning
-            BEGIN
-                UPDATE pattern_learning SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
-            END
-        """)
-        
-        # Update system stats trigger
-        cursor.execute("""
-            CREATE TRIGGER IF NOT EXISTS update_system_stats_timestamp
-            AFTER UPDATE ON system_stats
-            BEGIN
-                UPDATE system_stats SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
-            END
-        """)
-    
-    def _insert_initial_data(self, cursor):
-        """Insert initial system data and statistics"""
-        initial_stats = [
-            ('total_documents', '0', 'integer', 'Total number of processed documents'),
-            ('total_corrections', '0', 'integer', 'Total number of corrections made'),
-            ('avg_confidence', '0.0', 'float', 'Average extraction confidence'),
-            ('success_rate', '0.0', 'float', 'Overall success rate'),
-            ('database_version', DATABASE_VERSION, 'string', 'Database schema version'),
-            ('last_cleanup', datetime.now().isoformat(), 'datetime', 'Last cleanup timestamp'),
-            ('system_initialized', datetime.now().isoformat(), 'datetime', 'System initialization timestamp'),
-        ]
-        
-        for stat_name, stat_value, stat_type, description in initial_stats:
+        for stat_name, stat_value, stat_type in default_stats:
             cursor.execute("""
-                INSERT OR IGNORE INTO system_stats (stat_name, stat_value, stat_type, description)
-                VALUES (?, ?, ?, ?)
-            """, (stat_name, stat_value, stat_type, description))
+                INSERT OR IGNORE INTO system_stats (stat_name, stat_value, stat_type)
+                VALUES (?, ?, ?)
+            """, (stat_name, stat_value, stat_type))
     
     @contextmanager
-    def _get_connection(self):
-        """Get database connection with proper resource management"""
-        thread_id = threading.current_thread().ident
-        
-        with self._lock:
-            if thread_id not in self._connection_pool:
+    def get_connection(self):
+        """Get database connection with proper context management"""
+        conn = None
+        try:
+            with self.lock:
                 conn = sqlite3.connect(
                     self.db_path,
                     timeout=30.0,
+                    isolation_level=None,
                     check_same_thread=False
                 )
                 conn.row_factory = sqlite3.Row
                 conn.execute("PRAGMA foreign_keys = ON")
                 conn.execute("PRAGMA journal_mode = WAL")
                 conn.execute("PRAGMA synchronous = NORMAL")
-                conn.execute("PRAGMA cache_size = 10000")
-                self._connection_pool[thread_id] = conn
-            
-            conn = self._connection_pool[thread_id]
-        
-        try:
+                conn.execute("PRAGMA temp_store = MEMORY")
+                conn.execute("PRAGMA mmap_size = 268435456")  # 256MB
+                
             yield conn
+            
         except Exception as e:
-            conn.rollback()
-            raise
+            if conn:
+                conn.rollback()
+            logger.error(f"Database connection error: {e}")
+            raise DatabaseError(f"Database connection failed: {e}")
         finally:
-            pass  # Keep connection in pool for reuse
+            if conn:
+                conn.close()
     
-    def save_document_corrections(self, document_hash: str, filename: str,
-                                field_data: Dict[str, Any], table_data: List[Dict[str, Any]],
-                                engine: str = "unknown", confidence: float = 0.0,
-                                processing_time: float = 0.0, file_size: int = 0,
-                                user_id: str = None, metadata: Dict[str, Any] = None) -> bool:
+    def save_document_corrections(self, document_hash: str, fields: Dict[str, Any], 
+                                tables: List[Dict[str, Any]], metadata: Dict[str, Any] = None) -> bool:
         """
-        Save document corrections with comprehensive tracking
+        Save document corrections to database
         
         Args:
             document_hash: Unique document identifier
-            filename: Original filename
-            field_data: Extracted/corrected field data
-            table_data: Extracted/corrected table data
-            engine: Extraction engine used
-            confidence: Extraction confidence score
-            processing_time: Time taken for processing
-            file_size: File size in bytes
-            user_id: User identifier
+            fields: Field corrections data
+            tables: Table corrections data
             metadata: Additional metadata
-        
+            
         Returns:
             bool: Success status
         """
         try:
-            with self._get_connection() as conn:
+            with self.get_connection() as conn:
                 cursor = conn.cursor()
+                
+                # Convert complex data to JSON
+                fields_json = json.dumps(fields, default=str)
+                tables_json = json.dumps(tables, default=str)
+                metadata_json = json.dumps(metadata or {}, default=str)
                 
                 # Check if document already exists
                 cursor.execute(
-                    "SELECT id, version FROM document_corrections WHERE document_hash = ?",
+                    "SELECT id FROM document_corrections WHERE document_hash = ?",
                     (document_hash,)
                 )
                 existing = cursor.fetchone()
                 
                 current_time = datetime.now()
-                metadata_json = json.dumps(metadata) if metadata else None
                 
                 if existing:
-                    # Update existing document
-                    new_version = existing['version'] + 1
+                    # Update existing record
                     cursor.execute("""
-                        UPDATE document_corrections SET
-                            filename = ?, corrected_field_data = ?, corrected_table_data = ?,
-                            extraction_engine = ?, extraction_confidence = ?,
-                            correction_count = correction_count + 1,
-                            processing_time = ?, file_size = ?, updated_at = ?,
-                            version = ?, metadata = ?, user_id = ?
+                        UPDATE document_corrections 
+                        SET fields = ?, tables = ?, metadata = ?, 
+                            last_modified = ?, correction_count = correction_count + 1,
+                            updated_at = CURRENT_TIMESTAMP
                         WHERE document_hash = ?
-                    """, (
-                        filename, json.dumps(field_data), json.dumps(table_data),
-                        engine, confidence, processing_time, file_size, current_time,
-                        new_version, metadata_json, user_id, document_hash
-                    ))
+                    """, (fields_json, tables_json, metadata_json, current_time, document_hash))
                     
-                    # Log individual field corrections
-                    self._save_field_corrections(cursor, document_hash, field_data, user_id)
-                    
-                    # Log individual table corrections
-                    self._save_table_corrections(cursor, document_hash, table_data, user_id)
-                    
+                    logger.info(f"Updated corrections for document {document_hash[:8]}...")
                 else:
-                    # Insert new document
+                    # Insert new record
+                    filename = metadata.get('filename', 'unknown') if metadata else 'unknown'
+                    file_size = metadata.get('file_size', 0) if metadata else 0
+                    
                     cursor.execute("""
-                        INSERT INTO document_corrections (
-                            document_hash, filename, original_field_data, corrected_field_data,
-                            original_table_data, corrected_table_data, extraction_engine,
-                            extraction_confidence, processing_time, file_size,
-                            created_at, updated_at, metadata, user_id
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        document_hash, filename, json.dumps(field_data), json.dumps(field_data),
-                        json.dumps(table_data), json.dumps(table_data), engine, confidence,
-                        processing_time, file_size, current_time, current_time,
-                        metadata_json, user_id
-                    ))
+                        INSERT INTO document_corrections 
+                        (document_hash, filename, file_size, upload_date, last_modified, 
+                         fields, tables, metadata, correction_count)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    """, (document_hash, filename, file_size, current_time, current_time,
+                          fields_json, tables_json, metadata_json))
+                    
+                    logger.info(f"Saved new corrections for document {document_hash[:8]}...")
+                
+                # Save detailed field corrections
+                for field_name, field_value in fields.items():
+                    cursor.execute("""
+                        INSERT INTO field_corrections 
+                        (document_hash, field_name, corrected_value)
+                        VALUES (?, ?, ?)
+                    """, (document_hash, field_name, str(field_value)))
+                
+                # Save detailed table corrections
+                for i, table_data in enumerate(tables):
+                    table_json = json.dumps(table_data, default=str)
+                    cursor.execute("""
+                        INSERT INTO table_corrections 
+                        (document_hash, table_name, table_index, corrected_data)
+                        VALUES (?, ?, ?, ?)
+                    """, (document_hash, f"table_{i+1}", i, table_json))
                 
                 # Update system statistics
-                self._update_system_stats(cursor)
+                self._update_stat(cursor, 'total_corrections', 1, 'increment')
+                if not existing:
+                    self._update_stat(cursor, 'total_documents', 1, 'increment')
                 
                 # Log the operation
-                self.log_processing_event(
-                    document_hash=document_hash,
-                    operation="save_corrections",
-                    status="success",
-                    engine=engine,
-                    processing_time=processing_time,
-                    user_id=user_id
-                )
+                self._log_operation(cursor, document_hash, 'save_corrections', 'success', 0.0)
                 
                 conn.commit()
-                logger.info(f"Successfully saved corrections for document {document_hash}")
                 return True
                 
         except Exception as e:
-            logger.error(f"Failed to save corrections for {document_hash}: {str(e)}")
-            self.log_processing_event(
-                document_hash=document_hash,
-                operation="save_corrections",
-                status="error",
-                error_message=str(e),
-                user_id=user_id
-            )
+            logger.error(f"Failed to save corrections: {e}")
+            self._log_operation(None, document_hash, 'save_corrections', 'failed', 0.0, str(e))
             return False
-    
-    def _save_field_corrections(self, cursor, document_hash: str, field_data: Dict[str, Any], user_id: str = None):
-        """Save individual field corrections for detailed tracking"""
-        for field_name, corrected_value in field_data.items():
-            # Get original value if it exists
-            cursor.execute("""
-                SELECT original_field_data FROM document_corrections WHERE document_hash = ?
-            """, (document_hash,))
-            result = cursor.fetchone()
-            
-            original_value = None
-            if result and result['original_field_data']:
-                try:
-                    original_data = json.loads(result['original_field_data'])
-                    original_value = original_data.get(field_name)
-                except:
-                    pass
-            
-            # Determine correction type
-            correction_type = "new" if original_value is None else "modified" if original_value != corrected_value else "confirmed"
-            
-            cursor.execute("""
-                INSERT INTO field_corrections (
-                    document_hash, field_name, original_value, corrected_value,
-                    correction_type, confidence, created_at, user_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                document_hash, field_name, str(original_value) if original_value is not None else None,
-                str(corrected_value), correction_type, 1.0, datetime.now(), user_id
-            ))
-    
-    def _save_table_corrections(self, cursor, document_hash: str, table_data: List[Dict[str, Any]], user_id: str = None):
-        """Save individual table corrections for detailed tracking"""
-        for table_index, table_row in enumerate(table_data):
-            for row_index, (column_name, corrected_value) in enumerate(table_row.items()):
-                # Get original value if it exists
-                cursor.execute("""
-                    SELECT original_table_data FROM document_corrections WHERE document_hash = ?
-                """, (document_hash,))
-                result = cursor.fetchone()
-                
-                original_value = None
-                if result and result['original_table_data']:
-                    try:
-                        original_data = json.loads(result['original_table_data'])
-                        if table_index < len(original_data) and column_name in original_data[table_index]:
-                            original_value = original_data[table_index][column_name]
-                    except:
-                        pass
-                
-                # Determine correction type
-                correction_type = "new" if original_value is None else "modified" if original_value != corrected_value else "confirmed"
-                
-                cursor.execute("""
-                    INSERT INTO table_corrections (
-                        document_hash, table_index, row_index, column_name,
-                        original_value, corrected_value, correction_type,
-                        confidence, created_at, user_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    document_hash, table_index, row_index, column_name,
-                    str(original_value) if original_value is not None else None,
-                    str(corrected_value), correction_type, 1.0, datetime.now(), user_id
-                ))
     
     def load_document_corrections(self, document_hash: str) -> Optional[Dict[str, Any]]:
         """
@@ -589,109 +349,148 @@ class DatabaseManager:
             document_hash: Document identifier
             
         Returns:
-            Dict with correction data or None if not found
+            Dict containing fields and tables data, or None if not found
         """
         try:
-            with self._get_connection() as conn:
+            with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
                 cursor.execute("""
-                    SELECT * FROM document_corrections WHERE document_hash = ?
+                    SELECT fields, tables, metadata, filename, upload_date, 
+                           correction_count, extraction_confidence, processing_time
+                    FROM document_corrections 
+                    WHERE document_hash = ?
                 """, (document_hash,))
                 
                 result = cursor.fetchone()
-                if not result:
+                
+                if result:
+                    fields = json.loads(result['fields'])
+                    tables = json.loads(result['tables'])
+                    metadata = json.loads(result['metadata'] or '{}')
+                    
+                    # Convert table data back to DataFrames if needed
+                    if isinstance(tables, list):
+                        processed_tables = []
+                        for table_data in tables:
+                            if isinstance(table_data, dict) and 'records' in table_data:
+                                # Table was stored as records
+                                df = pd.DataFrame(table_data['records'])
+                                processed_tables.append(df)
+                            elif isinstance(table_data, list):
+                                # Table was stored as list of records
+                                df = pd.DataFrame(table_data)
+                                processed_tables.append(df)
+                            else:
+                                processed_tables.append(table_data)
+                        tables = processed_tables
+                    
+                    corrections_data = {
+                        'fields': fields,
+                        'tables': tables,
+                        'metadata': metadata,
+                        'document_info': {
+                            'filename': result['filename'],
+                            'upload_date': result['upload_date'],
+                            'correction_count': result['correction_count'],
+                            'extraction_confidence': result['extraction_confidence'],
+                            'processing_time': result['processing_time']
+                        }
+                    }
+                    
+                    logger.info(f"Loaded corrections for document {document_hash[:8]}...")
+                    return corrections_data
+                else:
+                    logger.info(f"No corrections found for document {document_hash[:8]}...")
                     return None
-                
-                # Parse JSON data
-                field_data = json.loads(result['corrected_field_data']) if result['corrected_field_data'] else {}
-                table_data = json.loads(result['corrected_table_data']) if result['corrected_table_data'] else []
-                metadata = json.loads(result['metadata']) if result['metadata'] else {}
-                
-                return {
-                    'document_hash': result['document_hash'],
-                    'filename': result['filename'],
-                    'field_data': field_data,
-                    'table_data': table_data,
-                    'engine': result['extraction_engine'],
-                    'confidence': result['extraction_confidence'],
-                    'last_updated': result['updated_at'],
-                    'version': result['version'],
-                    'metadata': metadata,
-                    'correction_count': result['correction_count']
-                }
-                
+                    
         except Exception as e:
-            logger.error(f"Failed to load corrections for {document_hash}: {str(e)}")
+            logger.error(f"Failed to load corrections: {e}")
             return None
     
-    def search_documents(self, query: str = None, limit: int = 100, 
-                        start_date: datetime = None, end_date: datetime = None,
-                        engine: str = None, min_confidence: float = None) -> List[Dict[str, Any]]:
+    def search_documents(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
         """
-        Search documents with advanced filtering
+        Search documents by filename or content
         
         Args:
-            query: Search query for filename or content
+            query: Search query
             limit: Maximum number of results
-            start_date: Filter by creation date (start)
-            end_date: Filter by creation date (end)
-            engine: Filter by extraction engine
-            min_confidence: Minimum confidence threshold
             
         Returns:
             List of matching documents
         """
         try:
-            with self._get_connection() as conn:
+            with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
-                # Build dynamic query
-                where_conditions = []
-                params = []
-                
-                if query:
-                    where_conditions.append("(filename LIKE ? OR corrected_field_data LIKE ?)")
-                    params.extend([f"%{query}%", f"%{query}%"])
-                
-                if start_date:
-                    where_conditions.append("created_at >= ?")
-                    params.append(start_date.isoformat())
-                
-                if end_date:
-                    where_conditions.append("created_at <= ?")
-                    params.append(end_date.isoformat())
-                
-                if engine:
-                    where_conditions.append("extraction_engine = ?")
-                    params.append(engine)
-                
-                if min_confidence is not None:
-                    where_conditions.append("extraction_confidence >= ?")
-                    params.append(min_confidence)
-                
-                where_clause = " AND ".join(where_conditions) if where_conditions else "1=1"
-                
-                sql = f"""
-                    SELECT document_hash, filename, extraction_engine, extraction_confidence,
-                           created_at, updated_at, correction_count, version
-                    FROM document_corrections
-                    WHERE {where_clause}
-                    ORDER BY updated_at DESC
+                # Search by filename, fields content, or metadata
+                cursor.execute("""
+                    SELECT document_hash, filename, upload_date, correction_count,
+                           extraction_confidence, file_size
+                    FROM document_corrections 
+                    WHERE filename LIKE ? OR fields LIKE ? OR metadata LIKE ?
+                    ORDER BY upload_date DESC
                     LIMIT ?
-                """
-                
-                params.append(limit)
-                cursor.execute(sql, params)
+                """, (f"%{query}%", f"%{query}%", f"%{query}%", limit))
                 
                 results = []
                 for row in cursor.fetchall():
-                    results.append(dict(row))
+                    results.append({
+                        'document_hash': row['document_hash'],
+                        'filename': row['filename'],
+                        'upload_date': row['upload_date'],
+                        'correction_count': row['correction_count'],
+                        'extraction_confidence': row['extraction_confidence'],
+                        'file_size': row['file_size']
+                    })
+                
+                logger.info(f"Found {len(results)} documents matching query: {query}")
+                return results
+                
+        except Exception as e:
+            logger.error(f"Search failed: {e}")
+            return []
+    
+    def get_recent_documents(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        Get recently processed documents
+        
+        Args:
+            limit: Maximum number of documents to return
+            
+        Returns:
+            List of recent documents
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                cursor.execute("""
+                    SELECT document_hash, filename, upload_date, last_modified,
+                           correction_count, extraction_confidence, file_size,
+                           processing_time
+                    FROM document_corrections 
+                    ORDER BY last_modified DESC
+                    LIMIT ?
+                """, (limit,))
+                
+                results = []
+                for row in cursor.fetchall():
+                    results.append({
+                        'document_hash': row['document_hash'][:8] + '...',
+                        'filename': row['filename'],
+                        'upload_date': row['upload_date'],
+                        'last_modified': row['last_modified'],
+                        'correction_count': row['correction_count'],
+                        'confidence': f"{row['extraction_confidence']:.1%}",
+                        'file_size_kb': f"{row['file_size'] / 1024:.1f}",
+                        'processing_time': f"{row['processing_time']:.2f}s"
+                    })
                 
                 return results
                 
         except Exception as e:
-            logger.error(f"Document search failed: {str(e)}")
+            logger.error(f"Failed to get recent documents: {e}")
             return []
     
     def delete_document(self, document_hash: str) -> bool:
@@ -705,359 +504,124 @@ class DatabaseManager:
             bool: Success status
         """
         try:
-            with self._get_connection() as conn:
+            with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
-                # Delete in order to respect foreign key constraints
-                tables = [
-                    'field_corrections',
-                    'table_corrections', 
-                    'document_corrections'
-                ]
-                
-                for table in tables:
-                    cursor.execute(f"DELETE FROM {table} WHERE document_hash = ?", (document_hash,))
-                
-                # Also delete related processing logs
+                # Delete from all related tables
+                cursor.execute("DELETE FROM field_corrections WHERE document_hash = ?", (document_hash,))
+                cursor.execute("DELETE FROM table_corrections WHERE document_hash = ?", (document_hash,))
                 cursor.execute("DELETE FROM processing_logs WHERE document_hash = ?", (document_hash,))
+                cursor.execute("DELETE FROM document_corrections WHERE document_hash = ?", (document_hash,))
                 
-                # Update system statistics
-                self._update_system_stats(cursor)
-                
+                # Update statistics
+                if cursor.rowcount > 0:
+                    self._update_stat(cursor, 'total_documents', -1, 'increment')
+                    
                 conn.commit()
-                logger.info(f"Successfully deleted document {document_hash}")
+                logger.info(f"Deleted document {document_hash[:8]}...")
                 return True
                 
         except Exception as e:
-            logger.error(f"Failed to delete document {document_hash}: {str(e)}")
+            logger.error(f"Failed to delete document: {e}")
             return False
     
-    def get_system_stats(self) -> Dict[str, Any]:
+    def save_pattern(self, pattern_id: str, pattern_type: str, pattern_name: str,
+                    pattern_data: Dict[str, Any], confidence: float = 0.0,
+                    metadata: Dict[str, Any] = None) -> bool:
         """
-        Get comprehensive system statistics
-        
-        Returns:
-            Dictionary with system statistics
-        """
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                
-                stats = {}
-                
-                # Get stored statistics
-                cursor.execute("SELECT stat_name, stat_value, stat_type FROM system_stats")
-                for row in cursor.fetchall():
-                    value = row['stat_value']
-                    if row['stat_type'] == 'integer':
-                        value = int(value)
-                    elif row['stat_type'] == 'float':
-                        value = float(value)
-                    stats[row['stat_name']] = value
-                
-                # Calculate real-time statistics
-                cursor.execute("SELECT COUNT(*) as count FROM document_corrections")
-                stats['total_documents'] = cursor.fetchone()['count']
-                
-                cursor.execute("SELECT SUM(correction_count) as count FROM document_corrections")
-                result = cursor.fetchone()
-                stats['total_corrections'] = result['count'] or 0
-                
-                cursor.execute("SELECT AVG(extraction_confidence) as avg FROM document_corrections")
-                result = cursor.fetchone()
-                stats['avg_confidence'] = result['avg'] or 0.0
-                
-                # Calculate success rate (documents with confidence > 0.7)
-                cursor.execute("""
-                    SELECT 
-                        COUNT(*) as total,
-                        SUM(CASE WHEN extraction_confidence > 0.7 THEN 1 ELSE 0 END) as successful
-                    FROM document_corrections
-                """)
-                result = cursor.fetchone()
-                if result['total'] > 0:
-                    stats['success_rate'] = result['successful'] / result['total']
-                else:
-                    stats['success_rate'] = 0.0
-                
-                # Engine usage statistics
-                cursor.execute("""
-                    SELECT extraction_engine, COUNT(*) as count
-                    FROM document_corrections
-                    GROUP BY extraction_engine
-                """)
-                engine_stats = {}
-                for row in cursor.fetchall():
-                    engine_stats[row['extraction_engine']] = row['count']
-                stats['engine_usage'] = engine_stats
-                
-                # Recent activity
-                cursor.execute("""
-                    SELECT COUNT(*) as count FROM document_corrections
-                    WHERE created_at > datetime('now', '-7 days')
-                """)
-                stats['documents_last_week'] = cursor.fetchone()['count']
-                
-                cursor.execute("""
-                    SELECT COUNT(*) as count FROM processing_logs
-                    WHERE created_at > datetime('now', '-24 hours') AND status = 'success'
-                """)
-                stats['successful_operations_today'] = cursor.fetchone()['count']
-                
-                return stats
-                
-        except Exception as e:
-            logger.error(f"Failed to get system stats: {str(e)}")
-            return {}
-    
-    def get_recent_documents(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """
-        Get recently processed documents
-        
-        Args:
-            limit: Maximum number of documents to return
-            
-        Returns:
-            List of recent documents
-        """
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                
-                cursor.execute("""
-                    SELECT document_hash, filename, extraction_engine, extraction_confidence,
-                           created_at, updated_at, correction_count
-                    FROM document_corrections
-                    ORDER BY updated_at DESC
-                    LIMIT ?
-                """, (limit,))
-                
-                results = []
-                for row in cursor.fetchall():
-                    results.append(dict(row))
-                
-                return results
-                
-        except Exception as e:
-            logger.error(f"Failed to get recent documents: {str(e)}")
-            return []
-    
-    def get_confidence_distribution(self) -> List[Dict[str, Any]]:
-        """
-        Get confidence score distribution for analytics
-        
-        Returns:
-            List of confidence data points
-        """
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                
-                cursor.execute("""
-                    SELECT extraction_confidence as confidence, COUNT(*) as count
-                    FROM document_corrections
-                    WHERE extraction_confidence IS NOT NULL
-                    GROUP BY ROUND(extraction_confidence, 1)
-                    ORDER BY confidence
-                """)
-                
-                results = []
-                for row in cursor.fetchall():
-                    results.append({
-                        'confidence': row['confidence'],
-                        'count': row['count']
-                    })
-                
-                return results
-                
-        except Exception as e:
-            logger.error(f"Failed to get confidence distribution: {str(e)}")
-            return []
-    
-    def get_processing_logs(self, days: int = 7, limit: int = 1000) -> List[Dict[str, Any]]:
-        """
-        Get processing logs for analytics
-        
-        Args:
-            days: Number of days to look back
-            limit: Maximum number of logs to return
-            
-        Returns:
-            List of processing logs
-        """
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                
-                cursor.execute("""
-                    SELECT log_id, document_hash, operation, status, engine,
-                           processing_time, created_at, metadata
-                    FROM processing_logs
-                    WHERE created_at > datetime('now', '-{} days')
-                    ORDER BY created_at DESC
-                    LIMIT ?
-                """.format(days), (limit,))
-                
-                results = []
-                for row in cursor.fetchall():
-                    log_entry = dict(row)
-                    if log_entry['metadata']:
-                        try:
-                            log_entry['metadata'] = json.loads(log_entry['metadata'])
-                        except:
-                            pass
-                    results.append(log_entry)
-                
-                return results
-                
-        except Exception as e:
-            logger.error(f"Failed to get processing logs: {str(e)}")
-            return []
-    
-    def log_processing_event(self, document_hash: str = None, operation: str = "unknown",
-                           status: str = "unknown", engine: str = None,
-                           processing_time: float = 0.0, error_message: str = None,
-                           metadata: Dict[str, Any] = None, user_id: str = None,
-                           session_id: str = None) -> bool:
-        """
-        Log processing event for monitoring and analytics
-        
-        Args:
-            document_hash: Document identifier
-            operation: Operation type
-            status: Operation status
-            engine: Engine used
-            processing_time: Time taken
-            error_message: Error message if failed
-            metadata: Additional metadata
-            user_id: User identifier
-            session_id: Session identifier
-            
-        Returns:
-            bool: Success status
-        """
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                
-                log_id = str(uuid.uuid4())
-                metadata_json = json.dumps(metadata) if metadata else None
-                
-                cursor.execute("""
-                    INSERT INTO processing_logs (
-                        log_id, document_hash, operation, status, engine,
-                        processing_time, error_message, created_at, metadata,
-                        user_id, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    log_id, document_hash, operation, status, engine,
-                    processing_time, error_message, datetime.now(), metadata_json,
-                    user_id, session_id
-                ))
-                
-                conn.commit()
-                return True
-                
-        except Exception as e:
-            logger.error(f"Failed to log processing event: {str(e)}")
-            return False
-    
-    def save_pattern(self, pattern_id: str, pattern_type: str, pattern_data: Dict[str, Any],
-                    confidence: float = 0.0, metadata: Dict[str, Any] = None) -> bool:
-        """
-        Save learned pattern to database
+        Save a learned pattern to database
         
         Args:
             pattern_id: Unique pattern identifier
-            pattern_type: Type of pattern
+            pattern_type: Type of pattern ('field' or 'table')
+            pattern_name: Human-readable pattern name
             pattern_data: Pattern data
-            confidence: Pattern confidence
+            confidence: Pattern confidence score
             metadata: Additional metadata
             
         Returns:
             bool: Success status
         """
         try:
-            with self._get_connection() as conn:
+            with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
-                metadata_json = json.dumps(metadata) if metadata else None
-                pattern_data_json = json.dumps(pattern_data)
+                pattern_json = json.dumps(pattern_data, default=str)
+                metadata_json = json.dumps(metadata or {}, default=str)
+                current_time = datetime.now()
                 
                 cursor.execute("""
-                    INSERT OR REPLACE INTO pattern_learning (
-                        pattern_id, pattern_type, pattern_data, confidence,
-                        created_at, updated_at, metadata, usage_count, success_count
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0)
-                """, (
-                    pattern_id, pattern_type, pattern_data_json, confidence,
-                    datetime.now(), datetime.now(), metadata_json
-                ))
+                    INSERT OR REPLACE INTO pattern_learning
+                    (pattern_id, pattern_type, pattern_name, pattern_data, confidence,
+                     created_date, metadata, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                """, (pattern_id, pattern_type, pattern_name, pattern_json, 
+                      confidence, current_time, metadata_json))
+                
+                # Update statistics
+                self._update_stat(cursor, 'total_patterns', 1, 'increment')
                 
                 conn.commit()
+                logger.info(f"Saved pattern {pattern_id}")
                 return True
                 
         except Exception as e:
-            logger.error(f"Failed to save pattern {pattern_id}: {str(e)}")
+            logger.error(f"Failed to save pattern: {e}")
             return False
     
-    def get_patterns(self, pattern_type: str = None, min_confidence: float = 0.0,
-                    active_only: bool = True) -> List[Dict[str, Any]]:
+    def load_patterns(self, pattern_type: str = None, active_only: bool = True) -> List[Dict[str, Any]]:
         """
-        Get learned patterns from database
+        Load patterns from database
         
         Args:
-            pattern_type: Filter by pattern type
-            min_confidence: Minimum confidence threshold
+            pattern_type: Filter by pattern type ('field' or 'table')
             active_only: Only return active patterns
             
         Returns:
             List of patterns
         """
         try:
-            with self._get_connection() as conn:
+            with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
-                where_conditions = []
+                query = "SELECT * FROM pattern_learning WHERE 1=1"
                 params = []
                 
                 if pattern_type:
-                    where_conditions.append("pattern_type = ?")
+                    query += " AND pattern_type = ?"
                     params.append(pattern_type)
                 
-                if min_confidence > 0:
-                    where_conditions.append("confidence >= ?")
-                    params.append(min_confidence)
-                
                 if active_only:
-                    where_conditions.append("is_active = 1")
+                    query += " AND is_active = 1"
                 
-                where_clause = " AND ".join(where_conditions) if where_conditions else "1=1"
+                query += " ORDER BY confidence DESC, usage_count DESC"
                 
-                sql = f"""
-                    SELECT * FROM pattern_learning
-                    WHERE {where_clause}
-                    ORDER BY confidence DESC, usage_count DESC
-                """
+                cursor.execute(query, params)
                 
-                cursor.execute(sql, params)
-                
-                results = []
+                patterns = []
                 for row in cursor.fetchall():
-                    pattern = dict(row)
-                    if pattern['pattern_data']:
-                        pattern['pattern_data'] = json.loads(pattern['pattern_data'])
-                    if pattern['metadata']:
-                        try:
-                            pattern['metadata'] = json.loads(pattern['metadata'])
-                        except:
-                            pass
-                    results.append(pattern)
+                    pattern_data = json.loads(row['pattern_data'])
+                    metadata = json.loads(row['metadata'] or '{}')
+                    
+                    patterns.append({
+                        'pattern_id': row['pattern_id'],
+                        'pattern_type': row['pattern_type'],
+                        'pattern_name': row['pattern_name'],
+                        'pattern_data': pattern_data,
+                        'confidence': row['confidence'],
+                        'usage_count': row['usage_count'],
+                        'success_rate': row['success_rate'],
+                        'created_date': row['created_date'],
+                        'last_used': row['last_used'],
+                        'metadata': metadata,
+                        'is_active': bool(row['is_active'])
+                    })
                 
-                return results
+                logger.info(f"Loaded {len(patterns)} patterns")
+                return patterns
                 
         except Exception as e:
-            logger.error(f"Failed to get patterns: {str(e)}")
+            logger.error(f"Failed to load patterns: {e}")
             return []
     
     def update_pattern_usage(self, pattern_id: str, success: bool = True) -> bool:
@@ -1066,215 +630,623 @@ class DatabaseManager:
         
         Args:
             pattern_id: Pattern identifier
-            success: Whether the pattern was successful
+            success: Whether the pattern was successfully applied
             
         Returns:
             bool: Success status
         """
         try:
-            with self._get_connection() as conn:
+            with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
-                if success:
-                    cursor.execute("""
-                        UPDATE pattern_learning SET
-                            usage_count = usage_count + 1,
-                            success_count = success_count + 1,
-                            last_used = ?,
-                            updated_at = ?
-                        WHERE pattern_id = ?
-                    """, (datetime.now(), datetime.now(), pattern_id))
-                else:
-                    cursor.execute("""
-                        UPDATE pattern_learning SET
-                            usage_count = usage_count + 1,
-                            last_used = ?,
-                            updated_at = ?
-                        WHERE pattern_id = ?
-                    """, (datetime.now(), datetime.now(), pattern_id))
-                
-                # Recalculate confidence based on success rate
+                # Get current stats
                 cursor.execute("""
-                    UPDATE pattern_learning SET
-                        confidence = CASE 
-                            WHEN usage_count > 0 THEN CAST(success_count AS FLOAT) / usage_count
-                            ELSE 0.0
-                        END
+                    SELECT usage_count, success_rate FROM pattern_learning 
                     WHERE pattern_id = ?
                 """, (pattern_id,))
                 
+                result = cursor.fetchone()
+                if not result:
+                    return False
+                
+                current_usage = result['usage_count']
+                current_success_rate = result['success_rate']
+                
+                # Calculate new success rate
+                total_attempts = current_usage + 1
+                successful_attempts = int(current_success_rate * current_usage)
+                if success:
+                    successful_attempts += 1
+                
+                new_success_rate = successful_attempts / total_attempts if total_attempts > 0 else 0.0
+                
+                # Update pattern
+                cursor.execute("""
+                    UPDATE pattern_learning 
+                    SET usage_count = ?, success_rate = ?, last_used = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE pattern_id = ?
+                """, (total_attempts, new_success_rate, pattern_id))
+                
                 conn.commit()
+                logger.debug(f"Updated pattern {pattern_id} usage stats")
                 return True
                 
         except Exception as e:
-            logger.error(f"Failed to update pattern usage for {pattern_id}: {str(e)}")
+            logger.error(f"Failed to update pattern usage: {e}")
             return False
     
-    def backup_database(self, backup_type: str = "manual") -> str:
+    def get_system_stats(self) -> Dict[str, Any]:
+        """
+        Get comprehensive system statistics
+        
+        Returns:
+            Dictionary of system statistics
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                stats = {}
+                
+                # Get basic stats from system_stats table
+                cursor.execute("SELECT stat_name, stat_value, stat_type FROM system_stats")
+                for row in cursor.fetchall():
+                    stats[row['stat_name']] = row['stat_value']
+                
+                # Calculate additional statistics
+                
+                # Document statistics
+                cursor.execute("SELECT COUNT(*) as count FROM document_corrections")
+                stats['total_documents'] = cursor.fetchone()['count']
+                
+                cursor.execute("SELECT AVG(extraction_confidence) as avg_conf FROM document_corrections")
+                result = cursor.fetchone()
+                stats['avg_extraction_confidence'] = result['avg_conf'] or 0.0
+                
+                cursor.execute("SELECT AVG(processing_time) as avg_time FROM document_corrections")
+                result = cursor.fetchone()
+                stats['avg_processing_time'] = result['avg_time'] or 0.0
+                
+                # Pattern statistics
+                cursor.execute("SELECT COUNT(*) as count FROM pattern_learning WHERE is_active = 1")
+                stats['active_patterns'] = cursor.fetchone()['count']
+                
+                cursor.execute("SELECT AVG(success_rate) as avg_success FROM pattern_learning WHERE is_active = 1")
+                result = cursor.fetchone()
+                stats['avg_pattern_success_rate'] = result['avg_success'] or 0.0
+                
+                # Database size
+                try:
+                    db_size = os.path.getsize(self.db_path)
+                    stats['database_size'] = db_size
+                    stats['database_size_mb'] = db_size / (1024 * 1024)
+                except:
+                    stats['database_size'] = 0
+                    stats['database_size_mb'] = 0.0
+                
+                # Recent activity
+                cursor.execute("""
+                    SELECT COUNT(*) as count FROM document_corrections 
+                    WHERE upload_date > date('now', '-7 days')
+                """)
+                stats['documents_last_week'] = cursor.fetchone()['count']
+                
+                cursor.execute("""
+                    SELECT COUNT(*) as count FROM processing_logs 
+                    WHERE created_at > date('now', '-1 day')
+                """)
+                stats['operations_last_day'] = cursor.fetchone()['count']
+                
+                # Error statistics
+                cursor.execute("""
+                    SELECT COUNT(*) as count FROM processing_logs 
+                    WHERE operation_status = 'failed'
+                """)
+                stats['total_errors'] = cursor.fetchone()['count']
+                
+                return stats
+                
+        except Exception as e:
+            logger.error(f"Failed to get system stats: {e}")
+            return {}
+    
+    def get_analytics_data(self, days: int = 30) -> Dict[str, Any]:
+        """
+        Get analytics data for dashboard
+        
+        Args:
+            days: Number of days to analyze
+            
+        Returns:
+            Analytics data dictionary
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                since_date = datetime.now() - timedelta(days=days)
+                analytics = {}
+                
+                # Document processing over time
+                cursor.execute("""
+                    SELECT DATE(upload_date) as date, COUNT(*) as count
+                    FROM document_corrections 
+                    WHERE upload_date > ?
+                    GROUP BY DATE(upload_date)
+                    ORDER BY date
+                """, (since_date,))
+                
+                processing_trend = []
+                for row in cursor.fetchall():
+                    processing_trend.append({
+                        'date': row['date'],
+                        'count': row['count']
+                    })
+                analytics['processing_trend'] = processing_trend
+                
+                # Confidence distribution
+                cursor.execute("""
+                    SELECT 
+                        CASE 
+                            WHEN extraction_confidence >= 0.9 THEN 'High (90%+)'
+                            WHEN extraction_confidence >= 0.7 THEN 'Medium (70-90%)'
+                            WHEN extraction_confidence >= 0.5 THEN 'Low (50-70%)'
+                            ELSE 'Very Low (<50%)'
+                        END as confidence_range,
+                        COUNT(*) as count
+                    FROM document_corrections
+                    WHERE upload_date > ?
+                    GROUP BY confidence_range
+                """, (since_date,))
+                
+                confidence_dist = []
+                for row in cursor.fetchall():
+                    confidence_dist.append({
+                        'range': row['confidence_range'],
+                        'count': row['count']
+                    })
+                analytics['confidence_distribution'] = confidence_dist
+                
+                # Top file types
+                cursor.execute("""
+                    SELECT 
+                        CASE 
+                            WHEN filename LIKE '%.pdf' THEN 'PDF'
+                            WHEN filename LIKE '%.doc%' THEN 'Word'
+                            WHEN filename LIKE '%.xls%' THEN 'Excel'
+                            ELSE 'Other'
+                        END as file_type,
+                        COUNT(*) as count
+                    FROM document_corrections
+                    WHERE upload_date > ?
+                    GROUP BY file_type
+                    ORDER BY count DESC
+                """, (since_date,))
+                
+                file_types = []
+                for row in cursor.fetchall():
+                    file_types.append({
+                        'type': row['file_type'],
+                        'count': row['count']
+                    })
+                analytics['file_types'] = file_types
+                
+                # Processing performance
+                cursor.execute("""
+                    SELECT 
+                        AVG(processing_time) as avg_time,
+                        MIN(processing_time) as min_time,
+                        MAX(processing_time) as max_time,
+                        COUNT(*) as total_processed
+                    FROM document_corrections
+                    WHERE upload_date > ? AND processing_time > 0
+                """, (since_date,))
+                
+                perf_data = cursor.fetchone()
+                analytics['performance'] = {
+                    'avg_processing_time': perf_data['avg_time'] or 0.0,
+                    'min_processing_time': perf_data['min_time'] or 0.0,
+                    'max_processing_time': perf_data['max_time'] or 0.0,
+                    'total_processed': perf_data['total_processed'] or 0
+                }
+                
+                # Error analysis
+                cursor.execute("""
+                    SELECT operation_type, COUNT(*) as error_count
+                    FROM processing_logs
+                    WHERE operation_status = 'failed' AND created_at > ?
+                    GROUP BY operation_type
+                    ORDER BY error_count DESC
+                """, (since_date,))
+                
+                error_analysis = []
+                for row in cursor.fetchall():
+                    error_analysis.append({
+                        'operation': row['operation_type'],
+                        'count': row['error_count']
+                    })
+                analytics['error_analysis'] = error_analysis
+                
+                return analytics
+                
+        except Exception as e:
+            logger.error(f"Failed to get analytics data: {e}")
+            return {}
+    
+    def backup_database(self, backup_path: str = None) -> str:
         """
         Create database backup
         
         Args:
-            backup_type: Type of backup (manual, automatic, scheduled)
+            backup_path: Custom backup path
             
         Returns:
-            str: Backup file path
+            str: Path to backup file
         """
         try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_filename = f"pdf_extraction_backup_{timestamp}.db"
-            backup_path = self.backup_dir / backup_filename
+            if not backup_path:
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                backup_path = f"backup_pdf_extraction_{timestamp}.db"
             
-            # Create backup
+            # Create backup using file copy
             shutil.copy2(self.db_path, backup_path)
             
-            # Record backup metadata
-            with self._get_connection() as conn:
+            # Update backup timestamp in stats
+            with self.get_connection() as conn:
                 cursor = conn.cursor()
-                
-                backup_id = str(uuid.uuid4())
-                file_size = os.path.getsize(backup_path)
-                expires_at = datetime.now() + timedelta(days=BACKUP_RETENTION_DAYS)
-                
-                cursor.execute("""
-                    INSERT INTO backup_metadata (
-                        backup_id, backup_path, backup_size, backup_type,
-                        created_at, expires_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                """, (
-                    backup_id, str(backup_path), file_size, backup_type,
-                    datetime.now(), expires_at
-                ))
-                
+                self._update_stat(cursor, 'last_backup', datetime.now().isoformat(), 'set')
                 conn.commit()
             
             logger.info(f"Database backed up to {backup_path}")
-            return str(backup_path)
+            return backup_path
             
         except Exception as e:
-            logger.error(f"Database backup failed: {str(e)}")
-            raise BackupError(f"Backup failed: {str(e)}")
+            logger.error(f"Backup failed: {e}")
+            raise DatabaseError(f"Failed to create backup: {e}")
     
-    def cleanup_old_data(self, days: int = 90) -> bool:
+    def cleanup_old_records(self, days: int = 90) -> int:
         """
-        Clean up old data to maintain database performance
+        Clean up old records from database
         
         Args:
-            days: Number of days to retain data
+            days: Number of days to keep
+            
+        Returns:
+            int: Number of records deleted
+        """
+        try:
+            cutoff_date = datetime.now() - timedelta(days=days)
+            deleted_count = 0
+            
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Clean up old processing logs
+                cursor.execute("""
+                    DELETE FROM processing_logs 
+                    WHERE created_at < ? AND operation_status != 'failed'
+                """, (cutoff_date,))
+                deleted_count += cursor.rowcount
+                
+                # Clean up old field corrections (keep document corrections)
+                cursor.execute("""
+                    DELETE FROM field_corrections 
+                    WHERE created_at < ? AND document_hash NOT IN (
+                        SELECT document_hash FROM document_corrections 
+                        WHERE last_modified > ?
+                    )
+                """, (cutoff_date, cutoff_date))
+                deleted_count += cursor.rowcount
+                
+                # Clean up old table corrections
+                cursor.execute("""
+                    DELETE FROM table_corrections 
+                    WHERE created_at < ? AND document_hash NOT IN (
+                        SELECT document_hash FROM document_corrections 
+                        WHERE last_modified > ?
+                    )
+                """, (cutoff_date, cutoff_date))
+                deleted_count += cursor.rowcount
+                
+                # Clean up unused patterns
+                cursor.execute("""
+                    UPDATE pattern_learning 
+                    SET is_active = 0 
+                    WHERE last_used < ? AND usage_count < 5
+                """, (cutoff_date,))
+                
+                conn.commit()
+                logger.info(f"Cleaned up {deleted_count} old records")
+                return deleted_count
+                
+        except Exception as e:
+            logger.error(f"Cleanup failed: {e}")
+            return 0
+    
+    def optimize_database(self) -> bool:
+        """
+        Optimize database performance
+        
+        Returns:
+            bool: Success status
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Analyze tables for query optimization
+                cursor.execute("ANALYZE")
+                
+                # Vacuum to reclaim space and defragment
+                cursor.execute("VACUUM")
+                
+                # Update table statistics
+                cursor.execute("PRAGMA optimize")
+                
+                conn.commit()
+                logger.info("Database optimization completed")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Database optimization failed: {e}")
+            return False
+    
+    def export_data(self, export_path: str, include_patterns: bool = True) -> bool:
+        """
+        Export all data to JSON file
+        
+        Args:
+            export_path: Path to export file
+            include_patterns: Whether to include pattern data
             
         Returns:
             bool: Success status
         """
         try:
-            with self._get_connection() as conn:
+            export_data = {}
+            
+            with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
-                cutoff_date = datetime.now() - timedelta(days=days)
+                # Export document corrections
+                cursor.execute("SELECT * FROM document_corrections")
+                documents = []
+                for row in cursor.fetchall():
+                    doc_data = dict(row)
+                    # Parse JSON fields
+                    doc_data['fields'] = json.loads(doc_data['fields'])
+                    doc_data['tables'] = json.loads(doc_data['tables'])
+                    doc_data['metadata'] = json.loads(doc_data['metadata'] or '{}')
+                    documents.append(doc_data)
                 
-                # Clean up old processing logs
-                cursor.execute("""
-                    DELETE FROM processing_logs 
-                    WHERE created_at < ? AND status != 'error'
-                """, (cutoff_date,))
-                logs_deleted = cursor.rowcount
+                export_data['documents'] = documents
                 
-                # Clean up expired backups
-                cursor.execute("""
-                    SELECT backup_path FROM backup_metadata 
-                    WHERE expires_at < ?
-                """, (datetime.now(),))
+                # Export patterns if requested
+                if include_patterns:
+                    cursor.execute("SELECT * FROM pattern_learning")
+                    patterns = []
+                    for row in cursor.fetchall():
+                        pattern_data = dict(row)
+                        pattern_data['pattern_data'] = json.loads(pattern_data['pattern_data'])
+                        pattern_data['metadata'] = json.loads(pattern_data['metadata'] or '{}')
+                        patterns.append(pattern_data)
+                    
+                    export_data['patterns'] = patterns
                 
-                expired_backups = cursor.fetchall()
-                for backup in expired_backups:
-                    try:
-                        backup_path = Path(backup['backup_path'])
-                        if backup_path.exists():
-                            backup_path.unlink()
-                    except Exception as e:
-                        logger.warning(f"Failed to delete backup file: {e}")
-                
-                cursor.execute("""
-                    DELETE FROM backup_metadata WHERE expires_at < ?
-                """, (datetime.now(),))
-                backups_deleted = cursor.rowcount
-                
-                # Update last cleanup timestamp
-                cursor.execute("""
-                    UPDATE system_stats SET stat_value = ?, updated_at = ?
-                    WHERE stat_name = 'last_cleanup'
-                """, (datetime.now().isoformat(), datetime.now()))
-                
-                conn.commit()
-                
-                logger.info(f"Cleanup completed: {logs_deleted} logs deleted, {backups_deleted} backups removed")
-                return True
-                
+                # Export system stats
+                export_data['system_stats'] = self.get_system_stats()
+                export_data['export_timestamp'] = datetime.now().isoformat()
+                export_data['export_version'] = '2.0.0'
+            
+            # Write to file (compressed if large)
+            if len(json.dumps(export_data)) > 1024 * 1024:  # > 1MB
+                with gzip.open(export_path, 'wt', encoding='utf-8') as f:
+                    json.dump(export_data, f, indent=2, default=str)
+            else:
+                with open(export_path, 'w', encoding='utf-8') as f:
+                    json.dump(export_data, f, indent=2, default=str)
+            
+            logger.info(f"Data exported to {export_path}")
+            return True
+            
         except Exception as e:
-            logger.error(f"Cleanup failed: {str(e)}")
+            logger.error(f"Data export failed: {e}")
             return False
     
-    def _update_system_stats(self, cursor):
-        """Update system statistics"""
+    def import_data(self, import_path: str) -> bool:
+        """
+        Import data from JSON file
+        
+        Args:
+            import_path: Path to import file
+            
+        Returns:
+            bool: Success status
+        """
         try:
-            # Get current counts
-            cursor.execute("SELECT COUNT(*) as count FROM document_corrections")
-            total_docs = cursor.fetchone()['count']
+            # Read data from file
+            if import_path.endswith('.gz'):
+                with gzip.open(import_path, 'rt', encoding='utf-8') as f:
+                    import_data = json.load(f)
+            else:
+                with open(import_path, 'r', encoding='utf-8') as f:
+                    import_data = json.load(f)
             
-            cursor.execute("SELECT SUM(correction_count) as count FROM document_corrections")
-            result = cursor.fetchone()
-            total_corrections = result['count'] or 0
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Import documents
+                if 'documents' in import_data:
+                    for doc in import_data['documents']:
+                        self.save_document_corrections(
+                            doc['document_hash'],
+                            doc['fields'],
+                            doc['tables'],
+                            doc.get('metadata', {})
+                        )
+                
+                # Import patterns
+                if 'patterns' in import_data:
+                    for pattern in import_data['patterns']:
+                        self.save_pattern(
+                            pattern['pattern_id'],
+                            pattern['pattern_type'],
+                            pattern['pattern_name'],
+                            pattern['pattern_data'],
+                            pattern.get('confidence', 0.0),
+                            pattern.get('metadata', {})
+                        )
+                
+                conn.commit()
             
-            cursor.execute("SELECT AVG(extraction_confidence) as avg FROM document_corrections")
-            result = cursor.fetchone()
-            avg_confidence = result['avg'] or 0.0
+            logger.info(f"Data imported from {import_path}")
+            return True
             
-            # Update stats
-            stats_updates = [
-                ('total_documents', str(total_docs)),
-                ('total_corrections', str(total_corrections)),
-                ('avg_confidence', str(avg_confidence))
-            ]
+        except Exception as e:
+            logger.error(f"Data import failed: {e}")
+            return False
+    
+    def calculate_extraction_confidence(self, fields: Dict[str, Any], 
+                                      tables: List[Dict[str, Any]]) -> float:
+        """
+        Calculate confidence score for extraction
+        
+        Args:
+            fields: Extracted fields
+            tables: Extracted tables
             
-            for stat_name, stat_value in stats_updates:
+        Returns:
+            float: Confidence score between 0 and 1
+        """
+        try:
+            total_score = 0.0
+            total_weight = 0.0
+            
+            # Field confidence scoring
+            for field_name, field_value in fields.items():
+                weight = 1.0
+                score = 0.0
+                
+                if field_value is not None and str(field_value).strip():
+                    score = 0.7  # Base score for non-empty field
+                    
+                    # Bonus for fields with expected patterns
+                    if field_name.lower() in ['date', 'amount', 'total', 'email', 'phone']:
+                        score += 0.2
+                    
+                    # Penalty for very short values
+                    if len(str(field_value).strip()) < 3:
+                        score -= 0.2
+                
+                total_score += score * weight
+                total_weight += weight
+            
+            # Table confidence scoring
+            for table_data in tables:
+                weight = 2.0  # Tables are weighted more heavily
+                score = 0.0
+                
+                if isinstance(table_data, dict) and 'records' in table_data:
+                    records = table_data['records']
+                elif isinstance(table_data, list):
+                    records = table_data
+                else:
+                    continue
+                
+                if records and len(records) > 1:
+                    score = 0.6  # Base score for valid table
+                    
+                    # Bonus for consistent columns
+                    if all(isinstance(record, dict) for record in records):
+                        first_keys = set(records[0].keys()) if records else set()
+                        if all(set(record.keys()) == first_keys for record in records[1:]):
+                            score += 0.3
+                
+                total_score += score * weight
+                total_weight += weight
+            
+            # Calculate final confidence
+            confidence = total_score / total_weight if total_weight > 0 else 0.0
+            return max(0.0, min(1.0, confidence))
+            
+        except Exception as e:
+            logger.error(f"Confidence calculation failed: {e}")
+            return 0.0
+    
+    def _update_stat(self, cursor, stat_name: str, value: Union[int, float, str], 
+                    operation: str = 'set'):
+        """Update system statistic"""
+        try:
+            if operation == 'increment':
                 cursor.execute("""
-                    UPDATE system_stats SET stat_value = ?, updated_at = ?
+                    UPDATE system_stats 
+                    SET stat_value = CAST(stat_value AS INTEGER) + ?, 
+                        last_updated = CURRENT_TIMESTAMP
                     WHERE stat_name = ?
-                """, (stat_value, datetime.now(), stat_name))
+                """, (value, stat_name))
+            elif operation == 'set':
+                cursor.execute("""
+                    UPDATE system_stats 
+                    SET stat_value = ?, last_updated = CURRENT_TIMESTAMP
+                    WHERE stat_name = ?
+                """, (str(value), stat_name))
                 
         except Exception as e:
-            logger.warning(f"Failed to update system stats: {str(e)}")
+            logger.error(f"Failed to update stat {stat_name}: {e}")
     
-    def _setup_cleanup_schedule(self):
-        """Setup automatic cleanup schedule"""
-        def cleanup_worker():
-            while True:
-                try:
-                    time.sleep(86400)  # 24 hours
-                    self.cleanup_old_data()
-                except Exception as e:
-                    logger.error(f"Scheduled cleanup failed: {str(e)}")
+    def _log_operation(self, cursor, document_hash: str, operation_type: str,
+                      operation_status: str, processing_time: float,
+                      error_message: str = None, metadata: Dict[str, Any] = None):
+        """Log an operation to the processing logs"""
+        try:
+            if cursor is None:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
+                    self._log_operation_internal(cursor, document_hash, operation_type,
+                                               operation_status, processing_time,
+                                               error_message, metadata)
+                    conn.commit()
+            else:
+                self._log_operation_internal(cursor, document_hash, operation_type,
+                                           operation_status, processing_time,
+                                           error_message, metadata)
+                
+        except Exception as e:
+            logger.error(f"Failed to log operation: {e}")
+    
+    def _log_operation_internal(self, cursor, document_hash: str, operation_type: str,
+                               operation_status: str, processing_time: float,
+                               error_message: str = None, metadata: Dict[str, Any] = None):
+        """Internal method to log operation"""
+        metadata_json = json.dumps(metadata or {}, default=str)
         
-        # Start cleanup thread
-        cleanup_thread = threading.Thread(target=cleanup_worker, daemon=True)
-        cleanup_thread.start()
+        cursor.execute("""
+            INSERT INTO processing_logs 
+            (document_hash, operation_type, operation_status, processing_time,
+             error_message, metadata)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (document_hash, operation_type, operation_status, processing_time,
+              error_message, metadata_json))
     
     def close(self):
-        """Close all database connections"""
-        with self._lock:
-            for conn in self._connection_pool.values():
-                try:
-                    conn.close()
-                except:
-                    pass
-            self._connection_pool.clear()
-        
-        logger.info("Database connections closed")
+        """Close database manager and cleanup resources"""
+        try:
+            with self.lock:
+                for conn in self.connection_pool.values():
+                    if conn:
+                        conn.close()
+                self.connection_pool.clear()
+            
+            logger.info("Database manager closed")
+            
+        except Exception as e:
+            logger.error(f"Error closing database manager: {e}")
     
     def __enter__(self):
+        """Context manager entry"""
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit"""
         self.close()
-
-# Export main class
-__all__ = ['DatabaseManager', 'DatabaseError', 'BackupError']

@@ -1,13 +1,17 @@
-#!/usr/bin/env python3
 """
 Pattern Learning Module for PDF Table Extraction System
-=======================================================
+======================================================
 
-Advanced machine learning module for adaptive pattern learning and extraction improvement.
-Learns from user corrections to enhance future extraction accuracy.
+Comprehensive machine learning module for adaptive pattern learning including:
+- Field pattern recognition and learning
+- Table structure analysis and pattern storage
+- Confidence scoring and validation
+- Pattern application and suggestion
+- Performance tracking and optimization
+- Smart fallback mechanisms
 
 Author: AI Assistant
-Version: 3.0.0
+Version: 2.0.0
 License: MIT
 """
 
@@ -15,1269 +19,1252 @@ import json
 import logging
 import re
 import hashlib
-import uuid
+import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple, Union, Set
 from collections import defaultdict, Counter
-import math
-import statistics
 from dataclasses import dataclass, asdict
-from enum import Enum
+import pandas as pd
 import numpy as np
+from pathlib import Path
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
-# Constants
-PATTERN_VERSION = "3.0.0"
-MIN_PATTERN_CONFIDENCE = 0.3
-MIN_PATTERN_USAGE = 3
-LEARNING_RATE = 0.1
-DECAY_FACTOR = 0.95
-MAX_PATTERNS_PER_TYPE = 100
-
-class PatternType(Enum):
-    """Types of patterns that can be learned"""
-    FIELD_PATTERN = "field_pattern"
-    TABLE_PATTERN = "table_pattern"
-    DOCUMENT_STRUCTURE = "document_structure"
-    VALUE_FORMAT = "value_format"
-    EXTRACTION_HINT = "extraction_hint"
-    VALIDATION_RULE = "validation_rule"
-    SEMANTIC_PATTERN = "semantic_pattern"
-
-class LearningMode(Enum):
-    """Learning modes for pattern extraction"""
-    CONSERVATIVE = "conservative"  # Only learn from high-confidence corrections
-    BALANCED = "balanced"         # Balance between learning and stability
-    AGGRESSIVE = "aggressive"     # Learn from all corrections
-
 @dataclass
 class FieldPattern:
-    """Field pattern data structure"""
+    """Data class for field patterns"""
+    pattern_id: str
     field_name: str
-    pattern_type: str
-    regex_pattern: Optional[str]
-    position_hints: Dict[str, Any]
-    value_type: str
+    data_type: str
+    regex_pattern: str
     validation_rules: List[str]
-    confidence: float
-    source_documents: List[str]
+    extraction_confidence: float
     usage_count: int
-    success_count: int
+    success_rate: float
+    examples: List[str]
+    created_date: datetime
+    last_used: Optional[datetime] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 @dataclass
 class TablePattern:
-    """Table pattern data structure"""
-    table_signature: str
-    column_patterns: Dict[str, Any]
-    row_patterns: Dict[str, Any]
-    structural_hints: Dict[str, Any]
-    extraction_rules: List[str]
-    confidence: float
-    source_documents: List[str]
+    """Data class for table patterns"""
+    pattern_id: str
+    table_type: str
+    column_structure: List[str]
+    header_patterns: List[str]
+    data_patterns: Dict[str, str]
+    validation_rules: List[str]
+    extraction_confidence: float
     usage_count: int
-    success_count: int
+    success_rate: float
+    examples: List[Dict[str, Any]]
+    created_date: datetime
+    last_used: Optional[datetime] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 @dataclass
-class LearningInsight:
-    """Learning insight data structure"""
-    insight_type: str
-    description: str
-    confidence: float
-    supporting_evidence: List[str]
-    suggested_actions: List[str]
-    created_at: datetime
+class LearningResult:
+    """Data class for learning operation results"""
+    patterns_learned: int
+    patterns_updated: int
+    field_patterns: int
+    table_patterns: int
+    success: bool
+    processing_time: float
+    errors: List[str]
+    metadata: Dict[str, Any]
+
+class PatternLearnerError(Exception):
+    """Custom exception for pattern learning operations"""
+    pass
 
 class PatternLearner:
-    """Advanced pattern learning and extraction optimization"""
+    """Advanced pattern learning system for PDF extraction optimization"""
     
-    def __init__(self, database_manager, learning_mode: LearningMode = LearningMode.BALANCED):
+    def __init__(self, database_manager, min_pattern_confidence: float = 0.5,
+                 max_patterns_per_type: int = 1000):
         """
         Initialize pattern learner
         
         Args:
-            database_manager: DatabaseManager instance
-            learning_mode: Learning mode (conservative, balanced, aggressive)
+            database_manager: Database manager instance
+            min_pattern_confidence: Minimum confidence for pattern acceptance
+            max_patterns_per_type: Maximum patterns to store per type
         """
         self.db_manager = database_manager
-        self.learning_mode = learning_mode
+        self.min_pattern_confidence = min_pattern_confidence
+        self.max_patterns_per_type = max_patterns_per_type
         
         # Pattern storage
         self.field_patterns: Dict[str, FieldPattern] = {}
         self.table_patterns: Dict[str, TablePattern] = {}
-        self.document_patterns: Dict[str, Any] = {}
         
         # Learning statistics
         self.learning_stats = {
-            'patterns_learned': 0,
-            'patterns_applied': 0,
-            'successful_applications': 0,
-            'last_learning_session': None,
-            'confidence_improvements': []
+            'total_corrections_analyzed': 0,
+            'patterns_created': 0,
+            'patterns_updated': 0,
+            'field_patterns_count': 0,
+            'table_patterns_count': 0,
+            'avg_pattern_confidence': 0.0,
+            'last_learning_session': None
         }
+        
+        # Thread safety
+        self.lock = threading.RLock()
         
         # Load existing patterns
         self._load_existing_patterns()
         
-        logger.info(f"PatternLearner initialized in {learning_mode.value} mode")
+        logger.info("PatternLearner initialized")
     
-    def learn_from_corrections(self, document_hash: str, field_data: Dict[str, Any], 
-                             table_data: List[Dict[str, Any]], 
-                             original_extraction: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _load_existing_patterns(self):
+        """Load existing patterns from database"""
+        try:
+            with self.lock:
+                # Load field patterns
+                field_patterns = self.db_manager.load_patterns(pattern_type='field')
+                for pattern_data in field_patterns:
+                    pattern = self._deserialize_field_pattern(pattern_data)
+                    if pattern:
+                        self.field_patterns[pattern.pattern_id] = pattern
+                
+                # Load table patterns
+                table_patterns = self.db_manager.load_patterns(pattern_type='table')
+                for pattern_data in table_patterns:
+                    pattern = self._deserialize_table_pattern(pattern_data)
+                    if pattern:
+                        self.table_patterns[pattern.pattern_id] = pattern
+                
+                logger.info(f"Loaded {len(self.field_patterns)} field patterns and {len(self.table_patterns)} table patterns")
+                
+        except Exception as e:
+            logger.error(f"Failed to load existing patterns: {e}")
+    
+    def learn_from_corrections(self, document_hash: str, fields: Dict[str, Any], 
+                              tables: List[pd.DataFrame], metadata: Dict[str, Any] = None) -> LearningResult:
         """
         Learn patterns from user corrections
         
         Args:
             document_hash: Document identifier
-            field_data: Corrected field data
-            table_data: Corrected table data
-            original_extraction: Original extraction before corrections
+            fields: Corrected field data
+            tables: Corrected table data
+            metadata: Additional metadata
             
         Returns:
-            Dictionary with learning results and statistics
+            LearningResult: Results of the learning operation
         """
-        try:
-            learning_results = {
-                'field_patterns_learned': 0,
-                'table_patterns_learned': 0,
-                'patterns_updated': 0,
-                'insights_generated': 0,
-                'confidence_improvement': 0.0
-            }
-            
-            # Learn field patterns
-            field_learning = self._learn_field_patterns(document_hash, field_data, original_extraction)
-            learning_results['field_patterns_learned'] = field_learning['patterns_learned']
-            learning_results['patterns_updated'] += field_learning['patterns_updated']
-            
-            # Learn table patterns
-            table_learning = self._learn_table_patterns(document_hash, table_data, original_extraction)
-            learning_results['table_patterns_learned'] = table_learning['patterns_learned']
-            learning_results['patterns_updated'] += table_learning['patterns_updated']
-            
-            # Generate insights
-            insights = self._generate_learning_insights(document_hash, field_data, table_data)
-            learning_results['insights_generated'] = len(insights)
-            
-            # Update learning statistics
-            self._update_learning_stats(learning_results)
-            
-            # Save patterns to database
-            self._save_patterns_to_database()
-            
-            logger.info(f"Learning completed for document {document_hash}: {learning_results}")
-            return learning_results
-            
-        except Exception as e:
-            logger.error(f"Error learning from corrections: {str(e)}")
-            return {'error': str(e)}
-    
-    def _learn_field_patterns(self, document_hash: str, field_data: Dict[str, Any], 
-                            original_extraction: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Learn patterns from field corrections"""
-        results = {'patterns_learned': 0, 'patterns_updated': 0}
+        start_time = datetime.now()
+        errors = []
+        patterns_learned = 0
+        patterns_updated = 0
         
-        for field_name, corrected_value in field_data.items():
-            try:
-                # Analyze field characteristics
-                field_analysis = self._analyze_field_value(field_name, corrected_value)
+        try:
+            with self.lock:
+                logger.info(f"Learning from corrections for document {document_hash[:8]}...")
                 
-                # Check if pattern exists
-                pattern_id = self._generate_field_pattern_id(field_name, field_analysis)
+                # Learn field patterns
+                field_results = self._learn_field_patterns(fields, document_hash, metadata)
+                patterns_learned += field_results['created']
+                patterns_updated += field_results['updated']
+                errors.extend(field_results['errors'])
                 
-                if pattern_id in self.field_patterns:
-                    # Update existing pattern
-                    pattern = self.field_patterns[pattern_id]
-                    self._update_field_pattern(pattern, corrected_value, document_hash)
-                    results['patterns_updated'] += 1
-                else:
-                    # Create new pattern
-                    pattern = self._create_field_pattern(field_name, corrected_value, document_hash, field_analysis)
-                    if pattern:
+                # Learn table patterns
+                table_results = self._learn_table_patterns(tables, document_hash, metadata)
+                patterns_learned += table_results['created']
+                patterns_updated += table_results['updated']
+                errors.extend(table_results['errors'])
+                
+                # Update learning statistics
+                self.learning_stats['total_corrections_analyzed'] += 1
+                self.learning_stats['patterns_created'] += patterns_learned
+                self.learning_stats['patterns_updated'] += patterns_updated
+                self.learning_stats['field_patterns_count'] = len(self.field_patterns)
+                self.learning_stats['table_patterns_count'] = len(self.table_patterns)
+                self.learning_stats['last_learning_session'] = datetime.now()
+                
+                # Calculate average confidence
+                all_patterns = list(self.field_patterns.values()) + list(self.table_patterns.values())
+                if all_patterns:
+                    avg_confidence = sum(p.extraction_confidence for p in all_patterns) / len(all_patterns)
+                    self.learning_stats['avg_pattern_confidence'] = avg_confidence
+                
+                # Save updated patterns to database
+                self._save_patterns_to_database()
+                
+                processing_time = (datetime.now() - start_time).total_seconds()
+                
+                return LearningResult(
+                    patterns_learned=patterns_learned,
+                    patterns_updated=patterns_updated,
+                    field_patterns=field_results['created'] + field_results['updated'],
+                    table_patterns=table_results['created'] + table_results['updated'],
+                    success=True,
+                    processing_time=processing_time,
+                    errors=errors,
+                    metadata={
+                        'document_hash': document_hash,
+                        'field_count': len(fields),
+                        'table_count': len(tables)
+                    }
+                )
+                
+        except Exception as e:
+            logger.error(f"Learning failed for document {document_hash}: {e}")
+            processing_time = (datetime.now() - start_time).total_seconds()
+            
+            return LearningResult(
+                patterns_learned=0,
+                patterns_updated=0,
+                field_patterns=0,
+                table_patterns=0,
+                success=False,
+                processing_time=processing_time,
+                errors=[str(e)],
+                metadata={'document_hash': document_hash}
+            )
+    
+    def _learn_field_patterns(self, fields: Dict[str, Any], document_hash: str,
+                             metadata: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Learn patterns from field data"""
+        results = {'created': 0, 'updated': 0, 'errors': []}
+        
+        try:
+            for field_name, field_value in fields.items():
+                if field_value is None or str(field_value).strip() == '':
+                    continue
+                
+                try:
+                    # Analyze field characteristics
+                    analysis = self._analyze_field(field_name, field_value)
+                    
+                    # Generate pattern ID
+                    pattern_id = self._generate_field_pattern_id(field_name, analysis['data_type'])
+                    
+                    if pattern_id in self.field_patterns:
+                        # Update existing pattern
+                        pattern = self.field_patterns[pattern_id]
+                        pattern.usage_count += 1
+                        pattern.last_used = datetime.now()
+                        
+                        # Update examples (keep only most recent 10)
+                        pattern.examples.append(str(field_value))
+                        if len(pattern.examples) > 10:
+                            pattern.examples = pattern.examples[-10:]
+                        
+                        # Recalculate confidence based on consistency
+                        pattern.extraction_confidence = self._calculate_field_confidence(pattern)
+                        
+                        results['updated'] += 1
+                        logger.debug(f"Updated field pattern {pattern_id}")
+                        
+                    else:
+                        # Create new pattern
+                        pattern = FieldPattern(
+                            pattern_id=pattern_id,
+                            field_name=field_name,
+                            data_type=analysis['data_type'],
+                            regex_pattern=analysis['regex_pattern'],
+                            validation_rules=analysis['validation_rules'],
+                            extraction_confidence=0.7,  # Initial confidence
+                            usage_count=1,
+                            success_rate=1.0,
+                            examples=[str(field_value)],
+                            created_date=datetime.now(),
+                            last_used=datetime.now(),
+                            metadata={
+                                'source_document': document_hash,
+                                'analysis': analysis
+                            }
+                        )
+                        
                         self.field_patterns[pattern_id] = pattern
-                        results['patterns_learned'] += 1
+                        results['created'] += 1
+                        logger.debug(f"Created new field pattern {pattern_id}")
                 
-                # Learn positional patterns if original extraction available
-                if original_extraction:
-                    self._learn_field_position_patterns(field_name, corrected_value, original_extraction)
-                
-            except Exception as e:
-                logger.warning(f"Error learning pattern for field {field_name}: {str(e)}")
-        
-        return results
-    
-    def _learn_table_patterns(self, document_hash: str, table_data: List[Dict[str, Any]], 
-                            original_extraction: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Learn patterns from table corrections"""
-        results = {'patterns_learned': 0, 'patterns_updated': 0}
-        
-        if not table_data:
+                except Exception as e:
+                    error_msg = f"Error learning field pattern for {field_name}: {e}"
+                    results['errors'].append(error_msg)
+                    logger.warning(error_msg)
+            
             return results
-        
-        try:
-            # Analyze table structure
-            table_analysis = self._analyze_table_structure(table_data)
-            
-            # Generate table signature
-            table_signature = self._generate_table_signature(table_analysis)
-            
-            if table_signature in self.table_patterns:
-                # Update existing pattern
-                pattern = self.table_patterns[table_signature]
-                self._update_table_pattern(pattern, table_data, document_hash)
-                results['patterns_updated'] += 1
-            else:
-                # Create new pattern
-                pattern = self._create_table_pattern(table_signature, table_data, document_hash, table_analysis)
-                if pattern:
-                    self.table_patterns[table_signature] = pattern
-                    results['patterns_learned'] += 1
-            
-            # Learn column patterns
-            column_patterns = self._learn_column_patterns(table_data)
-            results['patterns_learned'] += len(column_patterns)
             
         except Exception as e:
-            logger.warning(f"Error learning table patterns: {str(e)}")
-        
-        return results
+            results['errors'].append(f"Field pattern learning failed: {e}")
+            return results
     
-    def _analyze_field_value(self, field_name: str, value: Any) -> Dict[str, Any]:
-        """Analyze field value to extract patterns"""
-        analysis = {
-            'data_type': self._determine_data_type(value),
-            'length': len(str(value)) if value is not None else 0,
-            'format_pattern': self._extract_format_pattern(value),
-            'semantic_type': self._determine_semantic_type(field_name, value),
-            'validation_rules': self._generate_validation_rules(field_name, value),
-            'regex_pattern': self._generate_regex_pattern(value),
-            'normalization_hints': self._generate_normalization_hints(value)
-        }
+    def _learn_table_patterns(self, tables: List[pd.DataFrame], document_hash: str,
+                             metadata: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Learn patterns from table data"""
+        results = {'created': 0, 'updated': 0, 'errors': []}
         
-        return analysis
-    
-    def _analyze_table_structure(self, table_data: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Analyze table structure to extract patterns"""
-        if not table_data:
-            return {}
-        
-        # Get column information
-        columns = list(table_data[0].keys()) if table_data else []
-        
-        analysis = {
-            'column_count': len(columns),
-            'row_count': len(table_data),
-            'columns': columns,
-            'column_types': {},
-            'column_patterns': {},
-            'structural_hints': {}
-        }
-        
-        # Analyze each column
-        for col in columns:
-            col_values = [row.get(col) for row in table_data if row.get(col) is not None]
-            if col_values:
-                analysis['column_types'][col] = self._determine_column_type(col_values)
-                analysis['column_patterns'][col] = self._extract_column_patterns(col, col_values)
-        
-        # Detect structural patterns
-        analysis['structural_hints'] = self._detect_structural_patterns(table_data)
-        
-        return analysis
-    
-    def _determine_data_type(self, value: Any) -> str:
-        """Determine the data type of a value"""
-        if value is None:
-            return 'null'
-        elif isinstance(value, bool):
-            return 'boolean'
-        elif isinstance(value, int):
-            return 'integer'
-        elif isinstance(value, float):
-            return 'float'
-        elif isinstance(value, str):
-            # Check for special string types
-            value_str = value.strip().lower()
+        try:
+            for i, table in enumerate(tables):
+                if table.empty:
+                    continue
+                
+                try:
+                    # Analyze table characteristics
+                    analysis = self._analyze_table(table, i)
+                    
+                    # Generate pattern ID
+                    pattern_id = self._generate_table_pattern_id(analysis['table_type'], analysis['structure_hash'])
+                    
+                    if pattern_id in self.table_patterns:
+                        # Update existing pattern
+                        pattern = self.table_patterns[pattern_id]
+                        pattern.usage_count += 1
+                        pattern.last_used = datetime.now()
+                        
+                        # Update examples (keep only most recent 5)
+                        table_example = table.head(3).to_dict('records')
+                        pattern.examples.append(table_example)
+                        if len(pattern.examples) > 5:
+                            pattern.examples = pattern.examples[-5:]
+                        
+                        # Recalculate confidence
+                        pattern.extraction_confidence = self._calculate_table_confidence(pattern, table)
+                        
+                        results['updated'] += 1
+                        logger.debug(f"Updated table pattern {pattern_id}")
+                        
+                    else:
+                        # Create new pattern
+                        pattern = TablePattern(
+                            pattern_id=pattern_id,
+                            table_type=analysis['table_type'],
+                            column_structure=analysis['column_structure'],
+                            header_patterns=analysis['header_patterns'],
+                            data_patterns=analysis['data_patterns'],
+                            validation_rules=analysis['validation_rules'],
+                            extraction_confidence=0.7,  # Initial confidence
+                            usage_count=1,
+                            success_rate=1.0,
+                            examples=[table.head(3).to_dict('records')],
+                            created_date=datetime.now(),
+                            last_used=datetime.now(),
+                            metadata={
+                                'source_document': document_hash,
+                                'table_index': i,
+                                'analysis': analysis
+                            }
+                        )
+                        
+                        self.table_patterns[pattern_id] = pattern
+                        results['created'] += 1
+                        logger.debug(f"Created new table pattern {pattern_id}")
+                
+                except Exception as e:
+                    error_msg = f"Error learning table pattern for table {i}: {e}"
+                    results['errors'].append(error_msg)
+                    logger.warning(error_msg)
             
-            if re.match(r'^\d{4}-\d{2}-\d{2}', value_str):
-                return 'date'
-            elif re.match(r'^[\+\-]?\$?[\d,]+\.?\d*$', value_str):
-                return 'currency'
-            elif re.match(r'^\d+\.?\d*%$', value_str):
-                return 'percentage'
-            elif re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', value_str):
-                return 'email'
-            elif re.match(r'^[\+]?[\d\s\-\(\)]{10,}$', value_str):
-                return 'phone'
-            elif re.match(r'^https?://', value_str):
-                return 'url'
-            else:
-                return 'text'
-        else:
-            return 'unknown'
+            return results
+            
+        except Exception as e:
+            results['errors'].append(f"Table pattern learning failed: {e}")
+            return results
     
-    def _determine_column_type(self, values: List[Any]) -> str:
-        """Determine the most common data type in a column"""
-        type_counts = Counter()
+    def _analyze_field(self, field_name: str, field_value: Any) -> Dict[str, Any]:
+        """Analyze field characteristics for pattern creation"""
+        value_str = str(field_value).strip()
         
-        for value in values:
-            data_type = self._determine_data_type(value)
-            type_counts[data_type] += 1
-        
-        # Return most common type
-        return type_counts.most_common(1)[0][0] if type_counts else 'unknown'
-    
-    def _extract_format_pattern(self, value: Any) -> str:
-        """Extract format pattern from value"""
-        if value is None:
-            return ''
-        
-        value_str = str(value)
-        
-        # Replace digits with 'N', letters with 'A', preserve special characters
-        pattern = ''
-        for char in value_str:
-            if char.isdigit():
-                pattern += 'N'
-            elif char.isalpha():
-                pattern += 'A'
-            else:
-                pattern += char
-        
-        return pattern
-    
-    def _determine_semantic_type(self, field_name: str, value: Any) -> str:
-        """Determine semantic type based on field name and value"""
-        field_name_lower = field_name.lower()
-        
-        # Common semantic patterns
-        semantic_patterns = {
-            'id': ['id', 'identifier', 'number'],
-            'name': ['name', 'title', 'label'],
-            'address': ['address', 'location', 'street'],
-            'amount': ['amount', 'price', 'cost', 'total', 'sum'],
-            'date': ['date', 'time', 'created', 'updated'],
-            'contact': ['email', 'phone', 'contact'],
-            'status': ['status', 'state', 'condition'],
-            'category': ['category', 'type', 'class', 'group'],
-            'description': ['description', 'notes', 'comment', 'details']
+        analysis = {
+            'data_type': self._determine_data_type(value_str),
+            'regex_pattern': self._generate_regex_pattern(value_str),
+            'validation_rules': self._generate_validation_rules(field_name, value_str),
+            'length': len(value_str),
+            'has_digits': bool(re.search(r'\d', value_str)),
+            'has_letters': bool(re.search(r'[a-zA-Z]', value_str)),
+            'has_special_chars': bool(re.search(r'[^a-zA-Z0-9\s]', value_str)),
+            'normalized_name': self._normalize_field_name(field_name)
         }
         
-        for semantic_type, keywords in semantic_patterns.items():
-            if any(keyword in field_name_lower for keyword in keywords):
-                return semantic_type
-        
-        return 'generic'
+        return analysis
     
-    def _generate_validation_rules(self, field_name: str, value: Any) -> List[str]:
+    def _analyze_table(self, table: pd.DataFrame, table_index: int) -> Dict[str, Any]:
+        """Analyze table characteristics for pattern creation"""
+        columns = table.columns.tolist()
+        
+        # Determine table type based on column names and content
+        table_type = self._classify_table_type(columns, table)
+        
+        # Analyze column structure
+        column_structure = []
+        data_patterns = {}
+        
+        for col in columns:
+            col_analysis = self._analyze_column(table[col])
+            column_structure.append(col_analysis['data_type'])
+            data_patterns[col] = col_analysis['pattern']
+        
+        # Generate header patterns
+        header_patterns = [self._normalize_header(col) for col in columns]
+        
+        # Create structure hash for similarity detection
+        structure_hash = hashlib.md5(
+            json.dumps(sorted(header_patterns)).encode()
+        ).hexdigest()[:8]
+        
+        analysis = {
+            'table_type': table_type,
+            'column_structure': column_structure,
+            'header_patterns': header_patterns,
+            'data_patterns': data_patterns,
+            'validation_rules': self._generate_table_validation_rules(table),
+            'structure_hash': structure_hash,
+            'row_count': len(table),
+            'column_count': len(columns),
+            'density': table.count().sum() / (len(table) * len(columns)) if len(table) > 0 else 0
+        }
+        
+        return analysis
+    
+    def _determine_data_type(self, value: str) -> str:
+        """Determine data type of a field value"""
+        value = value.strip()
+        
+        # Date patterns
+        date_patterns = [
+            r'\d{4}-\d{2}-\d{2}',  # YYYY-MM-DD
+            r'\d{2}/\d{2}/\d{4}',  # MM/DD/YYYY
+            r'\d{2}-\d{2}-\d{4}',  # MM-DD-YYYY
+            r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}\b'  # Month DD, YYYY
+        ]
+        
+        for pattern in date_patterns:
+            if re.match(pattern, value, re.IGNORECASE):
+                return 'date'
+        
+        # Currency
+        if re.match(r'^\$?[\d,]+\.?\d*$', value) or re.search(r'[$€£¥₹]', value):
+            return 'currency'
+        
+        # Percentage
+        if re.match(r'^\d+\.?\d*%$', value):
+            return 'percentage'
+        
+        # Email
+        if re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', value):
+            return 'email'
+        
+        # Phone
+        phone_cleaned = re.sub(r'[\s\-\(\)\+\.]', '', value)
+        if len(phone_cleaned) >= 10 and phone_cleaned.isdigit():
+            return 'phone'
+        
+        # URL
+        if re.match(r'^https?://', value, re.IGNORECASE):
+            return 'url'
+        
+        # Integer
+        if re.match(r'^-?\d+$', value):
+            return 'integer'
+        
+        # Float
+        if re.match(r'^-?\d+\.\d+$', value):
+            return 'float'
+        
+        # Boolean
+        if value.lower() in ['true', 'false', 'yes', 'no', '1', '0']:
+            return 'boolean'
+        
+        # Default to string
+        return 'string'
+    
+    def _generate_regex_pattern(self, value: str) -> str:
+        """Generate regex pattern for a field value"""
+        data_type = self._determine_data_type(value)
+        
+        patterns = {
+            'date': r'\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4}',
+            'currency': r'\$?[\d,]+\.?\d*',
+            'percentage': r'\d+\.?\d*%',
+            'email': r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',
+            'phone': r'[\d\s\-\(\)\+\.]{10,}',
+            'url': r'https?://[^\s]+',
+            'integer': r'-?\d+',
+            'float': r'-?\d+\.\d+',
+            'boolean': r'true|false|yes|no|1|0',
+            'string': r'.+'
+        }
+        
+        return patterns.get(data_type, r'.+')
+    
+    def _generate_validation_rules(self, field_name: str, value: str) -> List[str]:
         """Generate validation rules for a field"""
         rules = []
-        
-        if value is None:
-            return rules
-        
         data_type = self._determine_data_type(value)
-        semantic_type = self._determine_semantic_type(field_name, value)
         
-        # Add type-specific validation rules
-        if data_type == 'integer':
-            rules.append(f"type:integer")
-            if isinstance(value, int) and value >= 0:
-                rules.append("min:0")
-        elif data_type == 'float':
-            rules.append(f"type:float")
-        elif data_type == 'currency':
-            rules.append("type:currency")
-            rules.append("format:currency")
-        elif data_type == 'email':
-            rules.append("type:email")
-            rules.append("format:email")
-        elif data_type == 'date':
-            rules.append("type:date")
-            rules.append("format:date")
+        # Required field rule
+        if value.strip():
+            rules.append('required')
         
-        # Add semantic validation rules
-        if semantic_type == 'amount':
-            rules.append("semantic:amount")
-            rules.append("min:0")
-        elif semantic_type == 'id':
-            rules.append("semantic:identifier")
-            rules.append("required:true")
+        # Type-specific rules
+        if data_type == 'email':
+            rules.append('valid_email')
+        elif data_type == 'phone':
+            rules.append('valid_phone')
+        elif data_type == 'url':
+            rules.append('valid_url')
+        elif data_type in ['integer', 'float', 'currency']:
+            rules.append('numeric')
+            if data_type == 'currency':
+                rules.append('positive')
+        elif data_type == 'percentage':
+            rules.append('percentage_range')
         
-        # Add length constraints
-        if isinstance(value, str):
-            length = len(value)
-            if length > 0:
-                rules.append(f"max_length:{min(length * 2, 255)}")  # Allow some flexibility
+        # Field name-based rules
+        field_lower = field_name.lower()
+        if 'amount' in field_lower or 'total' in field_lower or 'price' in field_lower:
+            rules.append('positive_number')
+        elif 'date' in field_lower:
+            rules.append('valid_date')
+        elif 'email' in field_lower:
+            rules.append('valid_email')
         
         return rules
     
-    def _generate_regex_pattern(self, value: Any) -> str:
-        """Generate regex pattern for value format"""
-        if value is None:
-            return ''
+    def _classify_table_type(self, columns: List[str], table: pd.DataFrame) -> str:
+        """Classify table type based on columns and content"""
+        column_names = [col.lower() for col in columns]
         
-        value_str = str(value).strip()
+        # Financial/Invoice table
+        financial_keywords = ['amount', 'price', 'total', 'cost', 'invoice', 'payment']
+        if any(keyword in ' '.join(column_names) for keyword in financial_keywords):
+            return 'financial'
         
-        # Generate regex based on data type
-        data_type = self._determine_data_type(value)
+        # Employee/Contact table
+        contact_keywords = ['name', 'email', 'phone', 'address', 'employee']
+        if any(keyword in ' '.join(column_names) for keyword in contact_keywords):
+            return 'contact'
         
-        if data_type == 'integer':
-            return r'^\d+$'
-        elif data_type == 'float':
-            return r'^\d+\.?\d*$'
-        elif data_type == 'currency':
-            return r'^\$?[\d,]+\.?\d*$'
-        elif data_type == 'percentage':
-            return r'^\d+\.?\d*%$'
-        elif data_type == 'email':
-            return r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-        elif data_type == 'phone':
-            return r'^[\+]?[\d\s\-\(\)]{10,}$'
-        elif data_type == 'date':
-            return r'^\d{4}-\d{2}-\d{2}$'
-        elif data_type == 'url':
-            return r'^https?://[^\s/$.?#].[^\s]*$'
-        else:
-            # Generate pattern based on actual value structure
-            pattern = ''
-            for char in value_str:
-                if char.isdigit():
-                    pattern += r'\d'
-                elif char.isalpha():
-                    pattern += r'[a-zA-Z]'
-                elif char in '.,;:!?':
-                    pattern += re.escape(char)
-                elif char.isspace():
-                    pattern += r'\s'
-                else:
-                    pattern += re.escape(char)
-            return f'^{pattern}$' if pattern else ''
+        # Inventory/Product table
+        inventory_keywords = ['product', 'item', 'quantity', 'stock', 'inventory']
+        if any(keyword in ' '.join(column_names) for keyword in inventory_keywords):
+            return 'inventory'
+        
+        # Schedule/Time table
+        time_keywords = ['date', 'time', 'schedule', 'appointment', 'meeting']
+        if any(keyword in ' '.join(column_names) for keyword in time_keywords):
+            return 'schedule'
+        
+        # Default to generic
+        return 'generic'
     
-    def _generate_normalization_hints(self, value: Any) -> List[str]:
-        """Generate normalization hints for value processing"""
-        hints = []
+    def _analyze_column(self, column: pd.Series) -> Dict[str, Any]:
+        """Analyze column characteristics"""
+        non_null_values = column.dropna().astype(str)
         
-        if value is None:
-            return hints
+        if len(non_null_values) == 0:
+            return {'data_type': 'string', 'pattern': r'.*'}
         
-        value_str = str(value)
+        # Sample a few values to determine type
+        sample_values = non_null_values.head(5).tolist()
         
-        # Common normalization patterns
-        if value_str != value_str.strip():
-            hints.append("trim_whitespace")
+        # Determine most common data type
+        type_counts = Counter()
+        for value in sample_values:
+            data_type = self._determine_data_type(value)
+            type_counts[data_type] += 1
         
-        if any(char.isupper() for char in value_str):
-            hints.append("preserve_case")
+        most_common_type = type_counts.most_common(1)[0][0]
+        pattern = self._generate_regex_pattern(sample_values[0])
         
-        if ',' in value_str and any(char.isdigit() for char in value_str):
-            hints.append("remove_number_commas")
-        
-        if '$' in value_str:
-            hints.append("extract_currency_symbol")
-        
-        if '%' in value_str:
-            hints.append("extract_percentage")
-        
-        return hints
+        return {
+            'data_type': most_common_type,
+            'pattern': pattern,
+            'sample_values': sample_values
+        }
     
-    def _generate_field_pattern_id(self, field_name: str, analysis: Dict[str, Any]) -> str:
+    def _generate_table_validation_rules(self, table: pd.DataFrame) -> List[str]:
+        """Generate validation rules for table"""
+        rules = []
+        
+        # Basic structure rules
+        rules.append(f'min_rows:{max(1, len(table) // 2)}')
+        rules.append(f'max_rows:{len(table) * 2}')
+        rules.append(f'column_count:{len(table.columns)}')
+        
+        # Content rules
+        numeric_columns = table.select_dtypes(include=[np.number]).columns
+        if len(numeric_columns) > 0:
+            rules.append('has_numeric_data')
+        
+        # Check for required columns based on table type
+        column_names = [col.lower() for col in table.columns]
+        if any('total' in col or 'amount' in col for col in column_names):
+            rules.append('has_totals')
+        
+        return rules
+    
+    def _normalize_field_name(self, field_name: str) -> str:
+        """Normalize field name for pattern matching"""
+        return re.sub(r'[^a-zA-Z0-9]', '_', field_name.lower()).strip('_')
+    
+    def _normalize_header(self, header: str) -> str:
+        """Normalize table header for pattern matching"""
+        return re.sub(r'[^a-zA-Z0-9]', '_', header.lower()).strip('_')
+    
+    def _generate_field_pattern_id(self, field_name: str, data_type: str) -> str:
         """Generate unique pattern ID for field"""
-        pattern_data = {
-            'field_name': field_name,
-            'data_type': analysis['data_type'],
-            'semantic_type': analysis['semantic_type'],
-            'format_pattern': analysis['format_pattern']
-        }
-        
-        pattern_string = json.dumps(pattern_data, sort_keys=True)
-        return hashlib.md5(pattern_string.encode()).hexdigest()
+        normalized_name = self._normalize_field_name(field_name)
+        return f"field_{normalized_name}_{data_type}"
     
-    def _generate_table_signature(self, analysis: Dict[str, Any]) -> str:
-        """Generate unique signature for table structure"""
-        signature_data = {
-            'column_count': analysis['column_count'],
-            'columns': sorted(analysis['columns']),
-            'column_types': analysis['column_types']
-        }
-        
-        signature_string = json.dumps(signature_data, sort_keys=True)
-        return hashlib.md5(signature_string.encode()).hexdigest()
+    def _generate_table_pattern_id(self, table_type: str, structure_hash: str) -> str:
+        """Generate unique pattern ID for table"""
+        return f"table_{table_type}_{structure_hash}"
     
-    def _create_field_pattern(self, field_name: str, value: Any, document_hash: str, 
-                            analysis: Dict[str, Any]) -> Optional[FieldPattern]:
-        """Create new field pattern"""
-        try:
-            # Only create pattern if confidence is sufficient
-            if self.learning_mode == LearningMode.CONSERVATIVE and analysis.get('confidence', 0.5) < 0.7:
-                return None
-            
-            pattern = FieldPattern(
-                field_name=field_name,
-                pattern_type=analysis['data_type'],
-                regex_pattern=analysis['regex_pattern'],
-                position_hints={},
-                value_type=analysis['semantic_type'],
-                validation_rules=analysis['validation_rules'],
-                confidence=0.8,  # Initial confidence
-                source_documents=[document_hash],
-                usage_count=1,
-                success_count=1
-            )
-            
-            return pattern
-            
-        except Exception as e:
-            logger.warning(f"Error creating field pattern: {str(e)}")
-            return None
+    def _calculate_field_confidence(self, pattern: FieldPattern) -> float:
+        """Calculate confidence score for field pattern"""
+        base_confidence = 0.5
+        
+        # Usage factor (more usage = higher confidence)
+        usage_factor = min(0.3, pattern.usage_count * 0.01)
+        
+        # Success rate factor
+        success_factor = pattern.success_rate * 0.2
+        
+        # Consistency factor (based on examples)
+        consistency_factor = self._calculate_field_consistency(pattern) * 0.2
+        
+        confidence = base_confidence + usage_factor + success_factor + consistency_factor
+        return min(1.0, max(0.0, confidence))
     
-    def _create_table_pattern(self, signature: str, table_data: List[Dict[str, Any]], 
-                            document_hash: str, analysis: Dict[str, Any]) -> Optional[TablePattern]:
-        """Create new table pattern"""
-        try:
-            pattern = TablePattern(
-                table_signature=signature,
-                column_patterns=analysis['column_patterns'],
-                row_patterns={},
-                structural_hints=analysis['structural_hints'],
-                extraction_rules=[],
-                confidence=0.7,  # Initial confidence
-                source_documents=[document_hash],
-                usage_count=1,
-                success_count=1
-            )
-            
-            return pattern
-            
-        except Exception as e:
-            logger.warning(f"Error creating table pattern: {str(e)}")
-            return None
+    def _calculate_table_confidence(self, pattern: TablePattern, table: pd.DataFrame) -> float:
+        """Calculate confidence score for table pattern"""
+        base_confidence = 0.5
+        
+        # Usage factor
+        usage_factor = min(0.3, pattern.usage_count * 0.01)
+        
+        # Success rate factor
+        success_factor = pattern.success_rate * 0.2
+        
+        # Structure consistency factor
+        structure_factor = self._calculate_table_consistency(pattern, table) * 0.3
+        
+        confidence = base_confidence + usage_factor + success_factor + structure_factor
+        return min(1.0, max(0.0, confidence))
     
-    def _update_field_pattern(self, pattern: FieldPattern, value: Any, document_hash: str):
-        """Update existing field pattern with new data"""
-        pattern.usage_count += 1
-        pattern.success_count += 1
+    def _calculate_field_consistency(self, pattern: FieldPattern) -> float:
+        """Calculate consistency score for field pattern examples"""
+        if len(pattern.examples) < 2:
+            return 0.5
         
-        if document_hash not in pattern.source_documents:
-            pattern.source_documents.append(document_hash)
+        # Check data type consistency
+        consistent_types = 0
+        for example in pattern.examples:
+            if self._determine_data_type(example) == pattern.data_type:
+                consistent_types += 1
         
-        # Update confidence based on usage
-        pattern.confidence = min(pattern.confidence + LEARNING_RATE * (1 - pattern.confidence), 0.95)
-        
-        # Update validation rules if needed
-        new_rules = self._generate_validation_rules(pattern.field_name, value)
-        for rule in new_rules:
-            if rule not in pattern.validation_rules:
-                pattern.validation_rules.append(rule)
+        return consistent_types / len(pattern.examples)
     
-    def _update_table_pattern(self, pattern: TablePattern, table_data: List[Dict[str, Any]], 
-                            document_hash: str):
-        """Update existing table pattern with new data"""
-        pattern.usage_count += 1
-        pattern.success_count += 1
+    def _calculate_table_consistency(self, pattern: TablePattern, table: pd.DataFrame) -> float:
+        """Calculate consistency score for table pattern"""
+        consistency_score = 0.0
+        factors = 0
         
-        if document_hash not in pattern.source_documents:
-            pattern.source_documents.append(document_hash)
+        # Column count consistency
+        if len(table.columns) == len(pattern.column_structure):
+            consistency_score += 0.5
+        factors += 1
         
-        # Update confidence
-        pattern.confidence = min(pattern.confidence + LEARNING_RATE * (1 - pattern.confidence), 0.95)
+        # Header pattern consistency
+        table_headers = [self._normalize_header(col) for col in table.columns]
+        matching_headers = sum(1 for h1, h2 in zip(table_headers, pattern.header_patterns) if h1 == h2)
+        if len(pattern.header_patterns) > 0:
+            consistency_score += (matching_headers / len(pattern.header_patterns)) * 0.5
+            factors += 1
         
-        # Update column patterns
-        for col in table_data[0].keys() if table_data else []:
-            col_values = [row.get(col) for row in table_data if row.get(col) is not None]
-            if col_values:
-                new_patterns = self._extract_column_patterns(col, col_values)
-                if col in pattern.column_patterns:
-                    pattern.column_patterns[col].update(new_patterns)
-                else:
-                    pattern.column_patterns[col] = new_patterns
+        return consistency_score / factors if factors > 0 else 0.0
     
-    def _extract_column_patterns(self, column_name: str, values: List[Any]) -> Dict[str, Any]:
-        """Extract patterns from column values"""
-        patterns = {
-            'data_type': self._determine_column_type(values),
-            'value_patterns': [],
-            'length_distribution': {},
-            'common_values': [],
-            'null_percentage': 0.0
-        }
-        
-        # Calculate null percentage
-        null_count = sum(1 for v in values if v is None or str(v).strip() == '')
-        patterns['null_percentage'] = null_count / len(values) if values else 0
-        
-        # Get length distribution
-        lengths = [len(str(v)) for v in values if v is not None]
-        if lengths:
-            patterns['length_distribution'] = {
-                'min': min(lengths),
-                'max': max(lengths),
-                'avg': statistics.mean(lengths),
-                'std': statistics.stdev(lengths) if len(lengths) > 1 else 0
-            }
-        
-        # Get common values
-        value_counts = Counter(str(v) for v in values if v is not None)
-        patterns['common_values'] = value_counts.most_common(5)
-        
-        # Extract format patterns
-        format_patterns = [self._extract_format_pattern(v) for v in values if v is not None]
-        pattern_counts = Counter(format_patterns)
-        patterns['value_patterns'] = pattern_counts.most_common(3)
-        
-        return patterns
-    
-    def _detect_structural_patterns(self, table_data: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Detect structural patterns in table data"""
-        patterns = {}
-        
-        if not table_data:
-            return patterns
-        
-        # Detect header patterns
-        columns = list(table_data[0].keys())
-        patterns['header_style'] = self._analyze_header_style(columns)
-        
-        # Detect row grouping patterns
-        patterns['grouping_patterns'] = self._detect_grouping_patterns(table_data)
-        
-        # Detect totals/summary rows
-        patterns['summary_patterns'] = self._detect_summary_patterns(table_data)
-        
-        return patterns
-    
-    def _analyze_header_style(self, headers: List[str]) -> Dict[str, Any]:
-        """Analyze header naming style"""
-        style = {
-            'case_style': 'mixed',
-            'separator_style': 'space',
-            'prefix_patterns': [],
-            'suffix_patterns': []
-        }
-        
-        # Analyze case style
-        if all(h.islower() for h in headers):
-            style['case_style'] = 'lowercase'
-        elif all(h.isupper() for h in headers):
-            style['case_style'] = 'uppercase'
-        elif all(h.istitle() for h in headers):
-            style['case_style'] = 'title'
-        
-        # Analyze separator style
-        if all('_' in h for h in headers):
-            style['separator_style'] = 'underscore'
-        elif all('-' in h for h in headers):
-            style['separator_style'] = 'hyphen'
-        elif all(' ' in h for h in headers):
-            style['separator_style'] = 'space'
-        
-        return style
-    
-    def _detect_grouping_patterns(self, table_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Detect row grouping patterns"""
-        patterns = []
-        
-        # Look for common grouping indicators
-        for col in table_data[0].keys() if table_data else []:
-            col_values = [row.get(col) for row in table_data]
-            
-            # Check for repeated values (potential grouping)
-            value_positions = defaultdict(list)
-            for i, value in enumerate(col_values):
-                if value is not None:
-                    value_positions[str(value)].append(i)
-            
-            # If values repeat in clusters, it might indicate grouping
-            for value, positions in value_positions.items():
-                if len(positions) > 1:
-                    # Check if positions are clustered
-                    gaps = [positions[i+1] - positions[i] for i in range(len(positions)-1)]
-                    if gaps and statistics.mean(gaps) < len(table_data) / len(positions):
-                        patterns.append({
-                            'type': 'grouping',
-                            'column': col,
-                            'value': value,
-                            'positions': positions
-                        })
-        
-        return patterns
-    
-    def _detect_summary_patterns(self, table_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Detect summary/total row patterns"""
-        patterns = []
-        
-        if len(table_data) < 2:
-            return patterns
-        
-        # Check last few rows for summary indicators
-        for i, row in enumerate(table_data[-3:], len(table_data)-3):
-            for col, value in row.items():
-                if value and isinstance(value, str):
-                    value_lower = value.lower()
-                    if any(keyword in value_lower for keyword in ['total', 'sum', 'summary', 'subtotal']):
-                        patterns.append({
-                            'type': 'summary',
-                            'row_index': i,
-                            'column': col,
-                            'indicator': value
-                        })
-        
-        return patterns
-    
-    def _learn_field_position_patterns(self, field_name: str, value: Any, 
-                                     original_extraction: Dict[str, Any]):
-        """Learn positional patterns for field extraction"""
-        # This would analyze where in the document the field was found
-        # and learn patterns about typical positions for similar fields
-        pass
-    
-    def _learn_column_patterns(self, table_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Learn patterns from table columns"""
-        patterns = []
-        
-        if not table_data:
-            return patterns
-        
-        for col in table_data[0].keys():
-            col_values = [row.get(col) for row in table_data if row.get(col) is not None]
-            if col_values:
-                col_pattern = self._extract_column_patterns(col, col_values)
-                patterns.append({
-                    'column_name': col,
-                    'pattern': col_pattern
-                })
-        
-        return patterns
-    
-    def get_learned_patterns(self, document_hash: str = None, pattern_type: str = None) -> Dict[str, Any]:
+    def get_learned_patterns(self, document_hash: str = None, 
+                           pattern_type: str = None) -> Dict[str, Any]:
         """
         Get learned patterns applicable to a document
         
         Args:
-            document_hash: Document identifier (optional)
-            pattern_type: Type of patterns to retrieve (optional)
+            document_hash: Document identifier (for context-specific patterns)
+            pattern_type: Filter by pattern type ('field' or 'table')
             
         Returns:
-            Dictionary with applicable patterns
+            Dictionary of applicable patterns
         """
         try:
-            patterns = {
-                'field_patterns': [],
-                'table_patterns': [],
-                'confidence_threshold': MIN_PATTERN_CONFIDENCE,
-                'pattern_count': 0
-            }
-            
-            # Get field patterns
-            for pattern_id, pattern in self.field_patterns.items():
-                if pattern.confidence >= MIN_PATTERN_CONFIDENCE:
-                    if pattern_type is None or pattern_type == 'field':
-                        patterns['field_patterns'].append({
-                            'pattern_id': pattern_id,
-                            'field_name': pattern.field_name,
-                            'pattern_type': pattern.pattern_type,
-                            'regex_pattern': pattern.regex_pattern,
-                            'validation_rules': pattern.validation_rules,
-                            'confidence': pattern.confidence,
-                            'usage_count': pattern.usage_count
-                        })
-            
-            # Get table patterns
-            for signature, pattern in self.table_patterns.items():
-                if pattern.confidence >= MIN_PATTERN_CONFIDENCE:
-                    if pattern_type is None or pattern_type == 'table':
-                        patterns['table_patterns'].append({
-                            'signature': signature,
-                            'column_patterns': pattern.column_patterns,
-                            'structural_hints': pattern.structural_hints,
-                            'confidence': pattern.confidence,
-                            'usage_count': pattern.usage_count
-                        })
-            
-            patterns['pattern_count'] = len(patterns['field_patterns']) + len(patterns['table_patterns'])
-            
-            return patterns
-            
+            with self.lock:
+                result = {
+                    'field_patterns': {},
+                    'table_patterns': {},
+                    'metadata': {
+                        'total_patterns': len(self.field_patterns) + len(self.table_patterns),
+                        'field_count': len(self.field_patterns),
+                        'table_count': len(self.table_patterns),
+                        'min_confidence_threshold': self.min_pattern_confidence
+                    }
+                }
+                
+                # Get field patterns
+                if pattern_type is None or pattern_type == 'field':
+                    for pattern_id, pattern in self.field_patterns.items():
+                        if pattern.extraction_confidence >= self.min_pattern_confidence:
+                            result['field_patterns'][pattern_id] = self._serialize_field_pattern(pattern)
+                
+                # Get table patterns
+                if pattern_type is None or pattern_type == 'table':
+                    for pattern_id, pattern in self.table_patterns.items():
+                        if pattern.extraction_confidence >= self.min_pattern_confidence:
+                            result['table_patterns'][pattern_id] = self._serialize_table_pattern(pattern)
+                
+                return result
+                
         except Exception as e:
-            logger.error(f"Error getting learned patterns: {str(e)}")
-            return {'error': str(e)}
+            logger.error(f"Failed to get learned patterns: {e}")
+            return {'field_patterns': {}, 'table_patterns': {}, 'metadata': {}}
     
-    def apply_patterns(self, field_data: Dict[str, Any], table_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def suggest_improvements(self, fields: Dict[str, Any], 
+                           tables: List[pd.DataFrame]) -> List[Dict[str, Any]]:
         """
-        Apply learned patterns to improve extraction
+        Suggest improvements based on learned patterns
         
         Args:
-            field_data: Field data to improve
-            table_data: Table data to improve
+            fields: Current field data
+            tables: Current table data
             
         Returns:
-            Dictionary with improved data and application results
+            List of improvement suggestions
         """
-        try:
-            results = {
-                'improved_field_data': field_data.copy(),
-                'improved_table_data': [row.copy() for row in table_data],
-                'patterns_applied': 0,
-                'improvements_made': 0,
-                'confidence_boost': 0.0
-            }
-            
-            # Apply field patterns
-            field_improvements = self._apply_field_patterns(results['improved_field_data'])
-            results['patterns_applied'] += field_improvements['patterns_applied']
-            results['improvements_made'] += field_improvements['improvements_made']
-            
-            # Apply table patterns
-            table_improvements = self._apply_table_patterns(results['improved_table_data'])
-            results['patterns_applied'] += table_improvements['patterns_applied']
-            results['improvements_made'] += table_improvements['improvements_made']
-            
-            # Calculate confidence boost
-            if results['patterns_applied'] > 0:
-                results['confidence_boost'] = min(0.1 * results['improvements_made'], 0.3)
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"Error applying patterns: {str(e)}")
-            return {'error': str(e)}
-    
-    def _apply_field_patterns(self, field_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Apply field patterns to improve field data"""
-        results = {'patterns_applied': 0, 'improvements_made': 0}
-        
-        for field_name, value in field_data.items():
-            # Find applicable patterns
-            applicable_patterns = self._find_applicable_field_patterns(field_name, value)
-            
-            for pattern in applicable_patterns:
-                try:
-                    # Apply pattern improvements
-                    improved_value = self._apply_field_pattern(value, pattern)
-                    if improved_value != value:
-                        field_data[field_name] = improved_value
-                        results['improvements_made'] += 1
-                    
-                    results['patterns_applied'] += 1
-                    
-                    # Update pattern usage
-                    self._update_pattern_usage(pattern, success=True)
-                    
-                except Exception as e:
-                    logger.warning(f"Error applying field pattern: {str(e)}")
-                    self._update_pattern_usage(pattern, success=False)
-        
-        return results
-    
-    def _apply_table_patterns(self, table_data: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Apply table patterns to improve table data"""
-        results = {'patterns_applied': 0, 'improvements_made': 0}
-        
-        if not table_data:
-            return results
-        
-        # Find applicable table patterns
-        table_analysis = self._analyze_table_structure(table_data)
-        applicable_patterns = self._find_applicable_table_patterns(table_analysis)
-        
-        for pattern in applicable_patterns:
-            try:
-                # Apply structural improvements
-                improvements = self._apply_table_pattern(table_data, pattern)
-                results['improvements_made'] += improvements
-                results['patterns_applied'] += 1
-                
-                # Update pattern usage
-                self._update_pattern_usage(pattern, success=improvements > 0)
-                
-            except Exception as e:
-                logger.warning(f"Error applying table pattern: {str(e)}")
-                self._update_pattern_usage(pattern, success=False)
-        
-        return results
-    
-    def _find_applicable_field_patterns(self, field_name: str, value: Any) -> List[FieldPattern]:
-        """Find field patterns applicable to a specific field"""
-        applicable = []
-        
-        for pattern in self.field_patterns.values():
-            if pattern.confidence >= MIN_PATTERN_CONFIDENCE:
-                # Check field name match
-                if pattern.field_name == field_name:
-                    applicable.append(pattern)
-                # Check semantic type match
-                elif pattern.value_type == self._determine_semantic_type(field_name, value):
-                    applicable.append(pattern)
-        
-        # Sort by confidence
-        applicable.sort(key=lambda p: p.confidence, reverse=True)
-        return applicable[:3]  # Return top 3 patterns
-    
-    def _find_applicable_table_patterns(self, table_analysis: Dict[str, Any]) -> List[TablePattern]:
-        """Find table patterns applicable to a table structure"""
-        applicable = []
-        
-        for pattern in self.table_patterns.values():
-            if pattern.confidence >= MIN_PATTERN_CONFIDENCE:
-                # Check structural similarity
-                similarity = self._calculate_table_similarity(table_analysis, pattern)
-                if similarity > 0.6:  # 60% similarity threshold
-                    applicable.append(pattern)
-        
-        # Sort by confidence
-        applicable.sort(key=lambda p: p.confidence, reverse=True)
-        return applicable[:2]  # Return top 2 patterns
-    
-    def _apply_field_pattern(self, value: Any, pattern: FieldPattern) -> Any:
-        """Apply field pattern to improve a value"""
-        if value is None:
-            return value
-        
-        improved_value = value
-        
-        # Apply normalization hints
-        for hint in pattern.validation_rules:
-            if hint == "trim_whitespace":
-                improved_value = str(improved_value).strip()
-            elif hint == "remove_number_commas" and isinstance(improved_value, str):
-                improved_value = improved_value.replace(',', '')
-            elif hint.startswith("type:"):
-                # Apply type conversion
-                target_type = hint.split(':')[1]
-                improved_value = self._convert_to_type(improved_value, target_type)
-        
-        return improved_value
-    
-    def _apply_table_pattern(self, table_data: List[Dict[str, Any]], pattern: TablePattern) -> int:
-        """Apply table pattern to improve table data"""
-        improvements = 0
-        
-        # Apply column pattern improvements
-        for row in table_data:
-            for col, value in row.items():
-                if col in pattern.column_patterns:
-                    col_pattern = pattern.column_patterns[col]
-                    improved_value = self._apply_column_pattern(value, col_pattern)
-                    if improved_value != value:
-                        row[col] = improved_value
-                        improvements += 1
-        
-        return improvements
-    
-    def _apply_column_pattern(self, value: Any, pattern: Dict[str, Any]) -> Any:
-        """Apply column pattern to improve a value"""
-        if value is None:
-            return value
-        
-        improved_value = value
-        
-        # Apply data type conversion
-        target_type = pattern.get('data_type')
-        if target_type:
-            improved_value = self._convert_to_type(improved_value, target_type)
-        
-        return improved_value
-    
-    def _convert_to_type(self, value: Any, target_type: str) -> Any:
-        """Convert value to target type"""
-        try:
-            if target_type == 'integer':
-                # Remove common formatting
-                clean_value = str(value).replace(',', '').replace('$', '').strip()
-                return int(float(clean_value))
-            elif target_type == 'float':
-                clean_value = str(value).replace(',', '').replace('$', '').strip()
-                return float(clean_value)
-            elif target_type == 'currency':
-                clean_value = str(value).replace(',', '').replace('$', '').strip()
-                return float(clean_value)
-            else:
-                return value
-        except (ValueError, TypeError):
-            return value
-    
-    def _calculate_table_similarity(self, analysis1: Dict[str, Any], pattern: TablePattern) -> float:
-        """Calculate similarity between table analysis and pattern"""
-        similarity = 0.0
-        
-        # Compare column count
-        if analysis1.get('column_count') == len(pattern.column_patterns):
-            similarity += 0.3
-        
-        # Compare column names
-        columns1 = set(analysis1.get('columns', []))
-        columns2 = set(pattern.column_patterns.keys())
-        if columns1 and columns2:
-            overlap = len(columns1.intersection(columns2))
-            similarity += 0.4 * (overlap / max(len(columns1), len(columns2)))
-        
-        # Compare column types
-        types1 = analysis1.get('column_types', {})
-        if types1:
-            type_matches = 0
-            for col, type1 in types1.items():
-                if col in pattern.column_patterns:
-                    col_pattern = pattern.column_patterns[col]
-                    if col_pattern.get('data_type') == type1:
-                        type_matches += 1
-            similarity += 0.3 * (type_matches / len(types1))
-        
-        return similarity
-    
-    def _update_pattern_usage(self, pattern: Union[FieldPattern, TablePattern], success: bool):
-        """Update pattern usage statistics"""
-        pattern.usage_count += 1
-        if success:
-            pattern.success_count += 1
-        
-        # Recalculate confidence
-        success_rate = pattern.success_count / pattern.usage_count
-        pattern.confidence = pattern.confidence * DECAY_FACTOR + success_rate * (1 - DECAY_FACTOR)
-    
-    def _generate_learning_insights(self, document_hash: str, field_data: Dict[str, Any], 
-                                  table_data: List[Dict[str, Any]]) -> List[LearningInsight]:
-        """Generate insights from learning session"""
-        insights = []
-        
-        # Analyze field patterns
-        field_insights = self._analyze_field_learning_insights(field_data)
-        insights.extend(field_insights)
-        
-        # Analyze table patterns
-        table_insights = self._analyze_table_learning_insights(table_data)
-        insights.extend(table_insights)
-        
-        return insights
-    
-    def _analyze_field_learning_insights(self, field_data: Dict[str, Any]) -> List[LearningInsight]:
-        """Analyze field learning for insights"""
-        insights = []
-        
-        # Group fields by data type
-        type_groups = defaultdict(list)
-        for field_name, value in field_data.items():
-            data_type = self._determine_data_type(value)
-            type_groups[data_type].append(field_name)
-        
-        # Generate insights for common patterns
-        for data_type, fields in type_groups.items():
-            if len(fields) > 2:  # Multiple fields of same type
-                insight = LearningInsight(
-                    insight_type="field_pattern",
-                    description=f"Multiple {data_type} fields detected: {', '.join(fields)}",
-                    confidence=0.7,
-                    supporting_evidence=fields,
-                    suggested_actions=[f"Create validation rules for {data_type} fields"],
-                    created_at=datetime.now()
-                )
-                insights.append(insight)
-        
-        return insights
-    
-    def _analyze_table_learning_insights(self, table_data: List[Dict[str, Any]]) -> List[LearningInsight]:
-        """Analyze table learning for insights"""
-        insights = []
-        
-        if not table_data:
-            return insights
-        
-        # Analyze column consistency
-        columns = list(table_data[0].keys())
-        for col in columns:
-            col_values = [row.get(col) for row in table_data if row.get(col) is not None]
-            if col_values:
-                data_types = [self._determine_data_type(v) for v in col_values]
-                type_consistency = len(set(data_types)) / len(data_types)
-                
-                if type_consistency > 0.8:  # High consistency
-                    insight = LearningInsight(
-                        insight_type="table_pattern",
-                        description=f"Column '{col}' shows high type consistency ({type_consistency:.1%})",
-                        confidence=0.8,
-                        supporting_evidence=[f"Data type: {max(set(data_types), key=data_types.count)}"],
-                        suggested_actions=[f"Apply strict validation for column '{col}'"],
-                        created_at=datetime.now()
-                    )
-                    insights.append(insight)
-        
-        return insights
-    
-    def _update_learning_stats(self, results: Dict[str, Any]):
-        """Update learning statistics"""
-        self.learning_stats['patterns_learned'] += (
-            results.get('field_patterns_learned', 0) + 
-            results.get('table_patterns_learned', 0)
-        )
-        self.learning_stats['last_learning_session'] = datetime.now()
-        
-        if 'confidence_improvement' in results:
-            self.learning_stats['confidence_improvements'].append(results['confidence_improvement'])
-    
-    def get_learning_statistics(self) -> Dict[str, Any]:
-        """Get comprehensive learning statistics"""
-        stats = self.learning_stats.copy()
-        
-        # Add pattern counts
-        stats['total_field_patterns'] = len(self.field_patterns)
-        stats['total_table_patterns'] = len(self.table_patterns)
-        stats['active_field_patterns'] = sum(1 for p in self.field_patterns.values() 
-                                           if p.confidence >= MIN_PATTERN_CONFIDENCE)
-        stats['active_table_patterns'] = sum(1 for p in self.table_patterns.values() 
-                                           if p.confidence >= MIN_PATTERN_CONFIDENCE)
-        
-        # Calculate average confidence
-        if self.field_patterns:
-            stats['avg_field_pattern_confidence'] = statistics.mean(
-                p.confidence for p in self.field_patterns.values()
-            )
-        
-        if self.table_patterns:
-            stats['avg_table_pattern_confidence'] = statistics.mean(
-                p.confidence for p in self.table_patterns.values()
-            )
-        
-        # Learning effectiveness
-        if self.learning_stats['patterns_applied'] > 0:
-            stats['learning_effectiveness'] = (
-                self.learning_stats['successful_applications'] / 
-                self.learning_stats['patterns_applied']
-            )
-        
-        return stats
-    
-    def suggest_improvements(self, field_data: Dict[str, Any], 
-                           table_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Suggest improvements based on learned patterns"""
         suggestions = []
         
-        # Analyze field data for suggestions
-        for field_name, value in field_data.items():
-            applicable_patterns = self._find_applicable_field_patterns(field_name, value)
-            for pattern in applicable_patterns:
-                if pattern.confidence > 0.8:
-                    suggestion = {
-                        'type': 'field_improvement',
-                        'field': field_name,
-                        'current_value': value,
-                        'suggested_improvement': self._apply_field_pattern(value, pattern),
-                        'confidence': pattern.confidence,
-                        'reason': f"Based on pattern learned from {len(pattern.source_documents)} documents"
-                    }
-                    suggestions.append(suggestion)
+        try:
+            with self.lock:
+                # Field suggestions
+                for field_name, field_value in fields.items():
+                    field_suggestions = self._get_field_suggestions(field_name, field_value)
+                    suggestions.extend(field_suggestions)
+                
+                # Table suggestions
+                for i, table in enumerate(tables):
+                    table_suggestions = self._get_table_suggestions(table, i)
+                    suggestions.extend(table_suggestions)
+                
+                return suggestions
+                
+        except Exception as e:
+            logger.error(f"Failed to generate suggestions: {e}")
+            return []
+    
+    def _get_field_suggestions(self, field_name: str, field_value: Any) -> List[Dict[str, Any]]:
+        """Get suggestions for field improvements"""
+        suggestions = []
+        value_str = str(field_value).strip()
         
-        # Analyze table data for suggestions
-        if table_data:
-            table_analysis = self._analyze_table_structure(table_data)
-            applicable_patterns = self._find_applicable_table_patterns(table_analysis)
+        # Find similar patterns
+        similar_patterns = self._find_similar_field_patterns(field_name, value_str)
+        
+        for pattern in similar_patterns:
+            # Validation suggestions
+            if not self._validate_field_against_pattern(value_str, pattern):
+                suggestions.append({
+                    'type': 'field_validation',
+                    'field_name': field_name,
+                    'current_value': value_str,
+                    'suggested_pattern': pattern.regex_pattern,
+                    'confidence': pattern.extraction_confidence,
+                    'reason': f"Value doesn't match learned pattern for {pattern.data_type} fields"
+                })
             
-            for pattern in applicable_patterns:
-                if pattern.confidence > 0.8:
-                    suggestion = {
-                        'type': 'table_improvement',
-                        'description': 'Apply learned table structure pattern',
-                        'confidence': pattern.confidence,
-                        'improvements': len(pattern.column_patterns),
-                        'reason': f"Based on pattern learned from {len(pattern.source_documents)} documents"
-                    }
-                    suggestions.append(suggestion)
+            # Format suggestions
+            if pattern.data_type in ['date', 'currency', 'percentage']:
+                formatted_value = self._suggest_format_improvement(value_str, pattern.data_type)
+                if formatted_value != value_str:
+                    suggestions.append({
+                        'type': 'field_format',
+                        'field_name': field_name,
+                        'current_value': value_str,
+                        'suggested_value': formatted_value,
+                        'confidence': pattern.extraction_confidence,
+                        'reason': f"Improved formatting for {pattern.data_type}"
+                    })
         
         return suggestions
     
-    def _load_existing_patterns(self):
-        """Load existing patterns from database"""
+    def _get_table_suggestions(self, table: pd.DataFrame, table_index: int) -> List[Dict[str, Any]]:
+        """Get suggestions for table improvements"""
+        suggestions = []
+        
+        # Find similar table patterns
+        similar_patterns = self._find_similar_table_patterns(table)
+        
+        for pattern in similar_patterns:
+            # Column structure suggestions
+            if len(table.columns) != len(pattern.column_structure):
+                suggestions.append({
+                    'type': 'table_structure',
+                    'table_index': table_index,
+                    'current_columns': len(table.columns),
+                    'suggested_columns': len(pattern.column_structure),
+                    'confidence': pattern.extraction_confidence,
+                    'reason': f"Column count mismatch with {pattern.table_type} pattern"
+                })
+            
+            # Header suggestions
+            table_headers = [self._normalize_header(col) for col in table.columns]
+            for i, (current, expected) in enumerate(zip(table_headers, pattern.header_patterns)):
+                if current != expected and pattern.extraction_confidence > 0.8:
+                    suggestions.append({
+                        'type': 'table_header',
+                        'table_index': table_index,
+                        'column_index': i,
+                        'current_header': table.columns[i],
+                        'suggested_header': expected,
+                        'confidence': pattern.extraction_confidence,
+                        'reason': f"Header doesn't match {pattern.table_type} pattern"
+                    })
+        
+        return suggestions
+    
+    def _find_similar_field_patterns(self, field_name: str, field_value: str) -> List[FieldPattern]:
+        """Find field patterns similar to current field"""
+        similar_patterns = []
+        normalized_name = self._normalize_field_name(field_name)
+        data_type = self._determine_data_type(field_value)
+        
+        for pattern in self.field_patterns.values():
+            # Exact match on normalized name and data type
+            if (pattern.metadata and 
+                pattern.metadata.get('analysis', {}).get('normalized_name') == normalized_name and
+                pattern.data_type == data_type):
+                similar_patterns.append(pattern)
+            
+            # Partial match on name similarity
+            elif (self._calculate_name_similarity(normalized_name, pattern.field_name) > 0.7 and
+                  pattern.data_type == data_type):
+                similar_patterns.append(pattern)
+        
+        # Sort by confidence
+        return sorted(similar_patterns, key=lambda p: p.extraction_confidence, reverse=True)
+    
+    def _find_similar_table_patterns(self, table: pd.DataFrame) -> List[TablePattern]:
+        """Find table patterns similar to current table"""
+        similar_patterns = []
+        table_headers = [self._normalize_header(col) for col in table.columns]
+        
+        for pattern in self.table_patterns.values():
+            # Calculate header similarity
+            similarity = self._calculate_header_similarity(table_headers, pattern.header_patterns)
+            
+            if similarity > 0.6:  # Minimum 60% similarity
+                similar_patterns.append(pattern)
+        
+        # Sort by confidence and similarity
+        return sorted(similar_patterns, key=lambda p: p.extraction_confidence, reverse=True)
+    
+    def _calculate_name_similarity(self, name1: str, name2: str) -> float:
+        """Calculate similarity between two field names"""
+        if not name1 or not name2:
+            return 0.0
+        
+        # Simple Jaccard similarity on character sets
+        set1 = set(name1.lower())
+        set2 = set(name2.lower())
+        
+        intersection = len(set1.intersection(set2))
+        union = len(set1.union(set2))
+        
+        return intersection / union if union > 0 else 0.0
+    
+    def _calculate_header_similarity(self, headers1: List[str], headers2: List[str]) -> float:
+        """Calculate similarity between two header lists"""
+        if not headers1 or not headers2:
+            return 0.0
+        
+        matches = 0
+        for h1 in headers1:
+            for h2 in headers2:
+                if self._calculate_name_similarity(h1, h2) > 0.8:
+                    matches += 1
+                    break
+        
+        return matches / max(len(headers1), len(headers2))
+    
+    def _validate_field_against_pattern(self, value: str, pattern: FieldPattern) -> bool:
+        """Validate field value against pattern"""
         try:
-            # Load field patterns
-            field_patterns = self.db_manager.get_patterns(pattern_type='field_pattern')
-            for pattern_data in field_patterns:
-                pattern_id = pattern_data['pattern_id']
-                data = pattern_data['pattern_data']
+            return bool(re.match(pattern.regex_pattern, value))
+        except:
+            return False
+    
+    def _suggest_format_improvement(self, value: str, data_type: str) -> str:
+        """Suggest format improvements for field value"""
+        if data_type == 'date':
+            # Try to standardize date format
+            date_patterns = [
+                (r'(\d{2})/(\d{2})/(\d{4})', r'\3-\1-\2'),  # MM/DD/YYYY -> YYYY-MM-DD
+                (r'(\d{1,2})/(\d{1,2})/(\d{4})', r'\3-\1-\2'),  # M/D/YYYY -> YYYY-M-D
+            ]
+            
+            for pattern, replacement in date_patterns:
+                if re.match(pattern, value):
+                    return re.sub(pattern, replacement, value)
+        
+        elif data_type == 'currency':
+            # Standardize currency format
+            cleaned = re.sub(r'[^\d.]', '', value)
+            if cleaned:
+                return f"${float(cleaned):.2f}"
+        
+        elif data_type == 'percentage':
+            # Standardize percentage format
+            cleaned = re.sub(r'[^\d.]', '', value)
+            if cleaned:
+                return f"{float(cleaned):.1f}%"
+        
+        return value
+    
+    def update_pattern_performance(self, pattern_id: str, success: bool) -> bool:
+        """
+        Update pattern performance metrics
+        
+        Args:
+            pattern_id: Pattern identifier
+            success: Whether the pattern application was successful
+            
+        Returns:
+            bool: Success status
+        """
+        try:
+            with self.lock:
+                pattern = None
                 
-                field_pattern = FieldPattern(
-                    field_name=data.get('field_name', ''),
-                    pattern_type=data.get('pattern_type', ''),
-                    regex_pattern=data.get('regex_pattern'),
-                    position_hints=data.get('position_hints', {}),
-                    value_type=data.get('value_type', ''),
-                    validation_rules=data.get('validation_rules', []),
-                    confidence=pattern_data['confidence'],
-                    source_documents=data.get('source_documents', []),
-                    usage_count=pattern_data['usage_count'],
-                    success_count=pattern_data['success_count']
-                )
-                self.field_patterns[pattern_id] = field_pattern
-            
-            # Load table patterns
-            table_patterns = self.db_manager.get_patterns(pattern_type='table_pattern')
-            for pattern_data in table_patterns:
-                signature = pattern_data['pattern_id']
-                data = pattern_data['pattern_data']
+                # Find pattern in field patterns
+                if pattern_id in self.field_patterns:
+                    pattern = self.field_patterns[pattern_id]
+                # Find pattern in table patterns
+                elif pattern_id in self.table_patterns:
+                    pattern = self.table_patterns[pattern_id]
                 
-                table_pattern = TablePattern(
-                    table_signature=signature,
-                    column_patterns=data.get('column_patterns', {}),
-                    row_patterns=data.get('row_patterns', {}),
-                    structural_hints=data.get('structural_hints', {}),
-                    extraction_rules=data.get('extraction_rules', []),
-                    confidence=pattern_data['confidence'],
-                    source_documents=data.get('source_documents', []),
-                    usage_count=pattern_data['usage_count'],
-                    success_count=pattern_data['success_count']
-                )
-                self.table_patterns[signature] = table_pattern
-            
-            logger.info(f"Loaded {len(self.field_patterns)} field patterns and {len(self.table_patterns)} table patterns")
-            
+                if pattern:
+                    # Update usage count
+                    pattern.usage_count += 1
+                    pattern.last_used = datetime.now()
+                    
+                    # Update success rate
+                    current_successes = pattern.success_rate * (pattern.usage_count - 1)
+                    if success:
+                        current_successes += 1
+                    
+                    pattern.success_rate = current_successes / pattern.usage_count
+                    
+                    # Recalculate confidence
+                    if isinstance(pattern, FieldPattern):
+                        pattern.extraction_confidence = self._calculate_field_confidence(pattern)
+                    else:
+                        # For table patterns, we need the original table (not available here)
+                        # So we use a simplified confidence calculation
+                        pattern.extraction_confidence = (
+                            pattern.extraction_confidence * 0.9 + pattern.success_rate * 0.1
+                        )
+                    
+                    # Update in database
+                    self.db_manager.update_pattern_usage(pattern_id, success)
+                    
+                    logger.debug(f"Updated pattern {pattern_id} performance: success={success}")
+                    return True
+                
+                return False
+                
         except Exception as e:
-            logger.warning(f"Error loading existing patterns: {str(e)}")
+            logger.error(f"Failed to update pattern performance: {e}")
+            return False
+    
+    def get_learning_statistics(self) -> Dict[str, Any]:
+        """
+        Get learning statistics and performance metrics
+        
+        Returns:
+            Dictionary of learning statistics
+        """
+        try:
+            with self.lock:
+                stats = self.learning_stats.copy()
+                
+                # Add current pattern counts
+                stats['current_field_patterns'] = len(self.field_patterns)
+                stats['current_table_patterns'] = len(self.table_patterns)
+                
+                # Calculate pattern usage statistics
+                if self.field_patterns:
+                    field_usage = [p.usage_count for p in self.field_patterns.values()]
+                    stats['avg_field_pattern_usage'] = sum(field_usage) / len(field_usage)
+                    stats['max_field_pattern_usage'] = max(field_usage)
+                
+                if self.table_patterns:
+                    table_usage = [p.usage_count for p in self.table_patterns.values()]
+                    stats['avg_table_pattern_usage'] = sum(table_usage) / len(table_usage)
+                    stats['max_table_pattern_usage'] = max(table_usage)
+                
+                # Pattern age analysis
+                now = datetime.now()
+                recent_patterns = 0
+                for pattern in list(self.field_patterns.values()) + list(self.table_patterns.values()):
+                    if (now - pattern.created_date).days < 7:
+                        recent_patterns += 1
+                
+                stats['recent_patterns_count'] = recent_patterns
+                
+                return stats
+                
+        except Exception as e:
+            logger.error(f"Failed to get learning statistics: {e}")
+            return {}
     
     def _save_patterns_to_database(self):
-        """Save patterns to database"""
+        """Save current patterns to database"""
         try:
             # Save field patterns
-            for pattern_id, pattern in self.field_patterns.items():
-                pattern_data = {
-                    'field_name': pattern.field_name,
-                    'pattern_type': pattern.pattern_type,
-                    'regex_pattern': pattern.regex_pattern,
-                    'position_hints': pattern.position_hints,
-                    'value_type': pattern.value_type,
-                    'validation_rules': pattern.validation_rules,
-                    'source_documents': pattern.source_documents
-                }
-                
+            for pattern in self.field_patterns.values():
+                pattern_data = self._serialize_field_pattern(pattern)
                 self.db_manager.save_pattern(
-                    pattern_id=pattern_id,
-                    pattern_type='field_pattern',
+                    pattern_id=pattern.pattern_id,
+                    pattern_type='field',
+                    pattern_name=pattern.field_name,
                     pattern_data=pattern_data,
-                    confidence=pattern.confidence
+                    confidence=pattern.extraction_confidence,
+                    metadata=pattern.metadata
                 )
-                
-                # Update usage statistics
-                self.db_manager.update_pattern_usage(pattern_id, success=True)
             
             # Save table patterns
-            for signature, pattern in self.table_patterns.items():
-                pattern_data = {
-                    'column_patterns': pattern.column_patterns,
-                    'row_patterns': pattern.row_patterns,
-                    'structural_hints': pattern.structural_hints,
-                    'extraction_rules': pattern.extraction_rules,
-                    'source_documents': pattern.source_documents
-                }
-                
+            for pattern in self.table_patterns.values():
+                pattern_data = self._serialize_table_pattern(pattern)
                 self.db_manager.save_pattern(
-                    pattern_id=signature,
-                    pattern_type='table_pattern',
+                    pattern_id=pattern.pattern_id,
+                    pattern_type='table',
+                    pattern_name=pattern.table_type,
                     pattern_data=pattern_data,
-                    confidence=pattern.confidence
+                    confidence=pattern.extraction_confidence,
+                    metadata=pattern.metadata
                 )
-                
-                # Update usage statistics
-                self.db_manager.update_pattern_usage(signature, success=True)
+            
+            logger.debug("Patterns saved to database")
             
         except Exception as e:
-            logger.error(f"Error saving patterns to database: {str(e)}")
-
-# Export main class
-__all__ = ['PatternLearner', 'PatternType', 'LearningMode', 'FieldPattern', 'TablePattern', 'LearningInsight']
+            logger.error(f"Failed to save patterns to database: {e}")
+    
+    def _serialize_field_pattern(self, pattern: FieldPattern) -> Dict[str, Any]:
+        """Serialize field pattern to dictionary"""
+        return {
+            'pattern_id': pattern.pattern_id,
+            'field_name': pattern.field_name,
+            'data_type': pattern.data_type,
+            'regex_pattern': pattern.regex_pattern,
+            'validation_rules': pattern.validation_rules,
+            'extraction_confidence': pattern.extraction_confidence,
+            'usage_count': pattern.usage_count,
+            'success_rate': pattern.success_rate,
+            'examples': pattern.examples,
+            'created_date': pattern.created_date.isoformat(),
+            'last_used': pattern.last_used.isoformat() if pattern.last_used else None,
+            'metadata': pattern.metadata
+        }
+    
+    def _serialize_table_pattern(self, pattern: TablePattern) -> Dict[str, Any]:
+        """Serialize table pattern to dictionary"""
+        return {
+            'pattern_id': pattern.pattern_id,
+            'table_type': pattern.table_type,
+            'column_structure': pattern.column_structure,
+            'header_patterns': pattern.header_patterns,
+            'data_patterns': pattern.data_patterns,
+            'validation_rules': pattern.validation_rules,
+            'extraction_confidence': pattern.extraction_confidence,
+            'usage_count': pattern.usage_count,
+            'success_rate': pattern.success_rate,
+            'examples': pattern.examples,
+            'created_date': pattern.created_date.isoformat(),
+            'last_used': pattern.last_used.isoformat() if pattern.last_used else None,
+            'metadata': pattern.metadata
+        }
+    
+    def _deserialize_field_pattern(self, data: Dict[str, Any]) -> Optional[FieldPattern]:
+        """Deserialize field pattern from dictionary"""
+        try:
+            pattern_data = data.get('pattern_data', {})
+            if isinstance(pattern_data, str):
+                pattern_data = json.loads(pattern_data)
+            
+            return FieldPattern(
+                pattern_id=pattern_data.get('pattern_id'),
+                field_name=pattern_data.get('field_name'),
+                data_type=pattern_data.get('data_type'),
+                regex_pattern=pattern_data.get('regex_pattern'),
+                validation_rules=pattern_data.get('validation_rules', []),
+                extraction_confidence=pattern_data.get('extraction_confidence', 0.0),
+                usage_count=pattern_data.get('usage_count', 0),
+                success_rate=pattern_data.get('success_rate', 0.0),
+                examples=pattern_data.get('examples', []),
+                created_date=datetime.fromisoformat(pattern_data.get('created_date')),
+                last_used=datetime.fromisoformat(pattern_data.get('last_used')) if pattern_data.get('last_used') else None,
+                metadata=pattern_data.get('metadata')
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to deserialize field pattern: {e}")
+            return None
+    
+    def _deserialize_table_pattern(self, data: Dict[str, Any]) -> Optional[TablePattern]:
+        """Deserialize table pattern from dictionary"""
+        try:
+            pattern_data = data.get('pattern_data', {})
+            if isinstance(pattern_data, str):
+                pattern_data = json.loads(pattern_data)
+            
+            return TablePattern(
+                pattern_id=pattern_data.get('pattern_id'),
+                table_type=pattern_data.get('table_type'),
+                column_structure=pattern_data.get('column_structure', []),
+                header_patterns=pattern_data.get('header_patterns', []),
+                data_patterns=pattern_data.get('data_patterns', {}),
+                validation_rules=pattern_data.get('validation_rules', []),
+                extraction_confidence=pattern_data.get('extraction_confidence', 0.0),
+                usage_count=pattern_data.get('usage_count', 0),
+                success_rate=pattern_data.get('success_rate', 0.0),
+                examples=pattern_data.get('examples', []),
+                created_date=datetime.fromisoformat(pattern_data.get('created_date')),
+                last_used=datetime.fromisoformat(pattern_data.get('last_used')) if pattern_data.get('last_used') else None,
+                metadata=pattern_data.get('metadata')
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to deserialize table pattern: {e}")
+            return None
+    
+    def cleanup_patterns(self, min_usage_count: int = 5, max_age_days: int = 90) -> int:
+        """
+        Clean up unused or old patterns
+        
+        Args:
+            min_usage_count: Minimum usage count to keep pattern
+            max_age_days: Maximum age in days to keep pattern
+            
+        Returns:
+            int: Number of patterns removed
+        """
+        try:
+            with self.lock:
+                removed_count = 0
+                cutoff_date = datetime.now() - timedelta(days=max_age_days)
+                
+                # Clean field patterns
+                patterns_to_remove = []
+                for pattern_id, pattern in self.field_patterns.items():
+                    if (pattern.usage_count < min_usage_count and 
+                        pattern.created_date < cutoff_date):
+                        patterns_to_remove.append(pattern_id)
+                
+                for pattern_id in patterns_to_remove:
+                    del self.field_patterns[pattern_id]
+                    removed_count += 1
+                
+                # Clean table patterns
+                patterns_to_remove = []
+                for pattern_id, pattern in self.table_patterns.items():
+                    if (pattern.usage_count < min_usage_count and 
+                        pattern.created_date < cutoff_date):
+                        patterns_to_remove.append(pattern_id)
+                
+                for pattern_id in patterns_to_remove:
+                    del self.table_patterns[pattern_id]
+                    removed_count += 1
+                
+                logger.info(f"Cleaned up {removed_count} unused patterns")
+                return removed_count
+                
+        except Exception as e:
+            logger.error(f"Pattern cleanup failed: {e}")
+            return 0
+    
+    def export_patterns(self, export_path: str) -> bool:
+        """
+        Export patterns to file
+        
+        Args:
+            export_path: Path to export file
+            
+        Returns:
+            bool: Success status
+        """
+        try:
+            with self.lock:
+                export_data = {
+                    'field_patterns': [self._serialize_field_pattern(p) for p in self.field_patterns.values()],
+                    'table_patterns': [self._serialize_table_pattern(p) for p in self.table_patterns.values()],
+                    'learning_stats': self.learning_stats,
+                    'export_timestamp': datetime.now().isoformat(),
+                    'export_version': '2.0.0'
+                }
+                
+                with open(export_path, 'w', encoding='utf-8') as f:
+                    json.dump(export_data, f, indent=2, default=str)
+                
+                logger.info(f"Patterns exported to {export_path}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Pattern export failed: {e}")
+            return False
+    
+    def import_patterns(self, import_path: str) -> bool:
+        """
+        Import patterns from file
+        
+        Args:
+            import_path: Path to import file
+            
+        Returns:
+            bool: Success status
+        """
+        try:
+            with self.lock:
+                with open(import_path, 'r', encoding='utf-8') as f:
+                    import_data = json.load(f)
+                
+                imported_count = 0
+                
+                # Import field patterns
+                for pattern_data in import_data.get('field_patterns', []):
+                    try:
+                        # Convert back to proper format for deserialization
+                        mock_data = {'pattern_data': pattern_data}
+                        pattern = self._deserialize_field_pattern(mock_data)
+                        if pattern:
+                            self.field_patterns[pattern.pattern_id] = pattern
+                            imported_count += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to import field pattern: {e}")
+                
+                # Import table patterns
+                for pattern_data in import_data.get('table_patterns', []):
+                    try:
+                        # Convert back to proper format for deserialization
+                        mock_data = {'pattern_data': pattern_data}
+                        pattern = self._deserialize_table_pattern(mock_data)
+                        if pattern:
+                            self.table_patterns[pattern.pattern_id] = pattern
+                            imported_count += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to import table pattern: {e}")
+                
+                # Update learning stats if available
+                if 'learning_stats' in import_data:
+                    self.learning_stats.update(import_data['learning_stats'])
+                
+                logger.info(f"Imported {imported_count} patterns from {import_path}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Pattern import failed: {e}")
+            return False
